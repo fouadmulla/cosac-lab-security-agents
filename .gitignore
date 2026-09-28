@@ -1,0 +1,14 @@
+*.egg-info/
+*.py[cod]
+*.tfstate
+*.tfstate.*
+.build/
+.build/
+.env
+.pytest_cache/
+.ruff_cache/
+.terraform/
+.venv/
+__pycache__/
+srcs.txt
+tfplan

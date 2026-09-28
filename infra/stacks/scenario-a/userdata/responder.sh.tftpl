@@ -1,0 +1,70 @@
+#!/bin/bash
+# Responder host. Stands in for the incident response team: probes both applications and publishes reachability to CloudWatch. The scoreboard reads this metric; nobody types the result.
+#
+# Amazon Linux 2023 already ships curl, aws, jq and dig, so this installs
+# nothing. An earlier version ran "dnf install -y curl", which conflicts with
+# the preinstalled curl-minimal; under set -e that aborted user-data before it
+# had written anything, and the failure was invisible until a demo command
+# found no script to run.
+#
+# Two rules follow from that, and both are worth keeping:
+#   1. Install nothing that is already present.
+#   2. Write the payload FIRST, so that anything which fails later cannot
+#      leave the host without its scripts.
+set -uo pipefail
+
+cat > /opt/canary.sh <<'CANARY'
+#!/bin/bash
+set -uo pipefail
+while true; do
+  for twin in a b; do
+    case $twin in
+      a) target="${target_a}" ;;
+      b) target="${target_b}" ;;
+    esac
+    # -f matters. Without it curl exits 0 on a 403, so a responder that WAF
+    # has locked out reports itself healthy -- which is the one thing this
+    # canary exists to notice, and it would have read green on stage while
+    # the responders were shut out.
+    # A path nothing else requests, so the agents can be told to ignore their
+    # own monitoring. Without it the canary IS the traffic whenever the
+    # attacker is quiet: one address, high volume, identical path -- which is
+    # exactly what abuse looks like, and the agents block it. Observed live:
+    # 51 invocations in ten minutes and the responders locked out with no
+    # attacker involved at all.
+    code=$(curl -6 -s -o /dev/null -w '%%{http_code}' --max-time 5 "http://$target${canary_path}" || echo 000)
+    case "$code" in
+      2*) reachable=1 ;;
+      *)  reachable=0 ;;
+    esac
+    # One-second resolution, so a lockout shows within seconds rather
+    # than whenever the next minute happens to close.
+    aws cloudwatch put-metric-data \
+      --region "${region}" \
+      --namespace "${metric_namespace}" \
+      --metric-name ResponderAccess \
+      --dimensions Twin=warden-$twin \
+      --storage-resolution 1 \
+      --value "$reachable" || true
+  done
+  sleep 10
+done
+CANARY
+
+chmod +x /opt/canary.sh
+
+cat > /etc/systemd/system/cosac-canary.service <<'UNIT'
+[Unit]
+Description=COSAC responder access canary
+After=network-online.target
+
+[Service]
+ExecStart=/opt/canary.sh
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+systemctl daemon-reload
+systemctl enable --now cosac-canary.service

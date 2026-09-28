@@ -1,0 +1,91 @@
+# Cost control and lab hygiene.
+#
+# The scenario stacks are meant to exist for the length of a rehearsal or a
+# talk, not overnight. A forgotten scenario-a stack is two load balancers and
+# two instances quietly billing until someone notices.
+#
+# This runs unattended, so it does NOT use the lab-apply environment -- a
+# scheduled job cannot wait for a human approval. Which is why it has its own
+# role: the apply role trusts exactly one subject, `...:environment:lab-apply`,
+# so this job could never assume it and failed every night on
+# sts:AssumeRoleWithWebIdentity. The teardown role is trusted only for
+# THIS workflow file on main, which is a narrower grant than the apply role
+# has, not a wider one.
+#
+# Safe by construction: the worst it can do is delete demo infrastructure that
+# is designed to be recreated in one click.
+#
+# Set vars.KEEP_STACKS_OVERNIGHT to 'true' the night before a talk.
+
+name: nightly teardown
+
+on:
+  schedule:
+    # 04:00 UTC daily -- overnight in North Carolina, so a stack deployed for
+    # an evening rehearsal is gone by morning.
+    - cron: "0 4 * * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: >-
+          Check the credentials and report what WOULD be destroyed, without
+          destroying it. The only safe way to test this workflow while a lab
+          is up -- and the schedule always destroys, whatever this says.
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  TF_VERSION: "1.13.3"
+  AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+
+jobs:
+  teardown:
+    if: vars.KEEP_STACKS_OVERNIGHT != 'true' && vars.AWS_TEARDOWN_ROLE_ARN != ''
+    runs-on: ubuntu-latest
+    strategy:
+      # Sequential: both stacks share the state bucket, and a failure in one
+      # should not leave the other half-destroyed without a visible result.
+      max-parallel: 1
+      matrix:
+        stack: [scenario-a, scenario-b]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_TEARDOWN_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: init
+        working-directory: infra/stacks/${{ matrix.stack }}
+        run: |
+          terraform init \
+            -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}" \
+            -backend-config="region=${{ env.AWS_REGION }}"
+
+      # Nothing deployed is the normal case. Report it and move on rather than
+      # failing the run, so a red cross means something went wrong.
+      - name: destroy if present
+        working-directory: infra/stacks/${{ matrix.stack }}
+        run: |
+          set -euo pipefail
+          count=$(terraform state list | wc -l)
+          if [ "$count" -eq 0 ]; then
+            echo "${{ matrix.stack }}: nothing deployed"
+            exit 0
+          fi
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] &&              [ "${{ inputs.dry_run }}" = "true" ]; then
+            echo "${{ matrix.stack }}: DRY RUN -- would destroy $count resources"
+            echo "${{ matrix.stack }}: dry run, $count resources left alone" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          terraform destroy -auto-approve
+          echo "${{ matrix.stack }}: destroyed" >> "$GITHUB_STEP_SUMMARY"

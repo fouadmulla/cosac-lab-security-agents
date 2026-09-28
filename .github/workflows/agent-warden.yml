@@ -1,0 +1,189 @@
+# Step 4: activate Scenario A in front of an audience.
+#
+# This workflow does not simulate anything. It issues a Systems Manager
+# command to a real EC2 host, which sources real HTTP requests from ~42
+# AWS-allocated IPv6 addresses to two real load balancers. The requests are
+# logged by real WAF, and the agents read those logs.
+#
+# The demo role can drive hosts and reverse blocks, but cannot create or
+# modify infrastructure. Triggering a demo and deploying one are separate
+# authorities on purpose.
+
+name: agent warden
+
+on:
+  workflow_dispatch:
+    inputs:
+      phase:
+        description: >-
+          stage-1 blinds the SOC. stage-2 is the real attack. scoreboard reads
+          the result. reset clears both IPSets.
+        required: true
+        default: stage-1
+        type: choice
+        options: [stage-1, stage-2, scoreboard, reset]
+      rounds:
+        description: Scanning rounds for stage 1 (each round is ~40 addresses)
+        required: false
+        default: "6"
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+
+jobs:
+  demo:
+    name: ${{ inputs.phase }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEMO_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: locate the hosts
+        id: hosts
+        run: |
+          set -euo pipefail
+          find_host() {
+            aws ec2 describe-instances \
+              --filters "Name=tag:Project,Values=cosac" \
+                        "Name=tag:Role,Values=$1" \
+                        "Name=instance-state-name,Values=running" \
+              --query 'Reservations[0].Instances[0].InstanceId' --output text
+          }
+          attacker=$(find_host attacker)
+          if [ "$attacker" = "None" ]; then
+            echo "::error::Scenario A is not deployed. Run the deploy workflow first."
+            exit 1
+          fi
+          echo "attacker=$attacker" >> "$GITHUB_OUTPUT"
+
+      - name: find the IPSets
+        id: ipsets
+        run: |
+          set -euo pipefail
+          for twin in a b; do
+            id=$(aws wafv2 list-ip-sets --scope REGIONAL \
+              --query "IPSets[?Name=='cosac-a-$twin-block'].Id | [0]" --output text)
+            echo "${twin}_id=$id" >> "$GITHUB_OUTPUT"
+          done
+
+      # -- stage 1 ---------------------------------------------------------
+      # Low-grade scanning from ~42 attested IPv6 addresses spanning three
+      # /64s. The tightest prefix covering them is a /62 that also contains
+      # the responder subnet.
+      - name: stage 1 - scanning
+        if: inputs.phase == 'stage-1'
+        run: |
+          set -euo pipefail
+          cmd=$(aws ssm send-command \
+            --instance-ids "${{ steps.hosts.outputs.attacker }}" \
+            --document-name AWS-RunShellScript \
+            --parameters "commands=['/opt/stage1.sh ${{ inputs.rounds }}']" \
+            --timeout-seconds 600 \
+            --query 'Command.CommandId' --output text)
+          echo "command=$cmd"
+
+          # Wait for it, so the job's own duration is the demo's duration and
+          # the operator can see on screen when the traffic has finished.
+          until [ "$(aws ssm get-command-invocation --command-id "$cmd" \
+                    --instance-id "${{ steps.hosts.outputs.attacker }}" \
+                    --query Status --output text)" != "InProgress" ]; do
+            sleep 5
+          done
+
+          aws ssm get-command-invocation --command-id "$cmd" \
+            --instance-id "${{ steps.hosts.outputs.attacker }}" \
+            --query StandardOutputContent --output text
+
+      # -- stage 2 ---------------------------------------------------------
+      # The real attack, from an address the defenders have never seen. On the
+      # Warden-A side the responders are watching. On the Warden-B side nobody
+      # can reach the application to look.
+      - name: stage 2 - the real attack
+        if: inputs.phase == 'stage-2'
+        run: |
+          set -euo pipefail
+          cmd=$(aws ssm send-command \
+            --instance-ids "${{ steps.hosts.outputs.attacker }}" \
+            --document-name AWS-RunShellScript \
+            --parameters "commands=['/opt/stage2.sh']" \
+            --query 'Command.CommandId' --output text)
+          until [ "$(aws ssm get-command-invocation --command-id "$cmd" \
+                    --instance-id "${{ steps.hosts.outputs.attacker }}" \
+                    --query Status --output text)" != "InProgress" ]; do
+            sleep 5
+          done
+          aws ssm get-command-invocation --command-id "$cmd" \
+            --instance-id "${{ steps.hosts.outputs.attacker }}" \
+            --query StandardOutputContent --output text
+
+      # -- scoreboard ------------------------------------------------------
+      - name: scoreboard
+        if: inputs.phase == 'scoreboard'
+        run: |
+          set -euo pipefail
+          {
+            echo "## Scenario A"
+            echo
+            echo "| | Warden-A | Warden-B |"
+            echo "|---|---|---|"
+
+            for twin in a b; do
+              : > "/tmp/$twin.raw"
+              for name in "cosac-a-$twin-block" "cosac-a-$twin-block-v4"; do
+                id=$(aws wafv2 list-ip-sets --scope REGIONAL \
+                  --query "IPSets[?Name=='$name'].Id | [0]" --output text)
+                [ "$id" = "None" ] && continue
+                aws wafv2 get-ip-set --scope REGIONAL \
+                  --name "$name" --id "$id" \
+                  --query 'IPSet.Addresses' --output json >> "/tmp/$twin.raw"
+              done
+              jq -s 'add // []' "/tmp/$twin.raw" > "/tmp/$twin.json"
+            done
+
+            echo "| Entries written | $(jq length /tmp/a.json) | $(jq length /tmp/b.json) |"
+            echo "| Widest entry | $(jq -r 'map(split("/")[1]|tonumber)|min // "-"' /tmp/a.json) | $(jq -r 'map(split("/")[1]|tonumber)|min // "-"' /tmp/b.json) |"
+            echo
+            echo "### Entries"
+            echo '```'
+            echo "warden-a: $(jq -c . /tmp/a.json)"
+            echo "warden-b: $(jq -c . /tmp/b.json)"
+            echo '```'
+            echo
+            echo "Responder access over the last 15 minutes is the headline;"
+            echo "read it from the CloudWatch dashboard, metric ResponderAccess."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # -- reset -----------------------------------------------------------
+      # Also the break-glass path: empties both IPSets, which restores
+      # responder access immediately whatever Warden-B has done.
+      - name: reset
+        if: inputs.phase == 'reset'
+        run: |
+          set -euo pipefail
+          # Both families. A WAF IPSet holds one, so each twin has two sets
+          # and a reset that cleared only the IPv6 one would leave every
+          # blocked internet scanner in place -- invisibly, because the
+          # board shows the two as a single blocklist.
+          for twin in a b; do
+            for name in "cosac-a-$twin-block" "cosac-a-$twin-block-v4"; do
+              id=$(aws wafv2 list-ip-sets --scope REGIONAL \
+                --query "IPSets[?Name=='$name'].Id | [0]" --output text)
+              if [ "$id" = "None" ] || [ -z "$id" ]; then
+                echo "no $name; skipping"
+                continue
+              fi
+              token=$(aws wafv2 get-ip-set --scope REGIONAL \
+                --name "$name" --id "$id" \
+                --query LockToken --output text)
+              aws wafv2 update-ip-set --scope REGIONAL \
+                --name "$name" --id "$id" \
+                --addresses '[]' --lock-token "$token"
+              echo "cleared $name"
+            done
+          done

@@ -1,0 +1,683 @@
+AWSTemplateFormatVersion: "2010-09-09"
+
+Description: >-
+  Always-on bootstrap for cosac-security-agents. Holds only what must survive
+  between demos: OIDC access, Terraform state, the decision ledger, the
+  approval topic, and the agent image repository.
+
+  Everything here is idle-priced. Expected steady-state cost is well under
+  USD 1/month: S3 and ECR charge for a few MB of storage, DynamoDB and SNS
+  charge nothing when idle, and IAM is free. The expensive resources -- load
+  balancers, EC2, AgentCore runtimes -- live in the scenario stacks, which are
+  created and destroyed on demand.
+
+  Deploy once, by hand, into the lab account:
+
+    aws cloudformation deploy \
+      --template-file infra/bootstrap/bootstrap.yaml \
+      --stack-name cosac-bootstrap \
+      --region us-east-1 \
+      --capabilities CAPABILITY_NAMED_IAM \
+      --parameter-overrides GitHubOrg=fouadmulla RepoName=cosac-security-agents
+
+  Then set the outputs as repository variables (see docs/RUNBOOK.md).
+
+  This template is deliberately not managed by the pipeline it authorises.
+
+Parameters:
+  GitHubOrg:
+    Type: String
+    Description: GitHub account or organisation that owns the repository.
+
+  RepoName:
+    Type: String
+    Default: cosac-security-agents
+
+  GitHubOwnerId:
+    Type: String
+    Default: ""
+    Description: >-
+      Numeric owner ID. Required when the organisation has enabled immutable
+      unique IDs in the OIDC subject claim, which makes GitHub emit
+      "repo:owner@<ownerId>/repo@<repoId>:..." instead of "repo:owner/repo:...".
+      Find it with:  gh api users/<owner> --jq .id
+      Leave empty for the classic name-only subject format.
+
+  GitHubRepoId:
+    Type: String
+    Default: ""
+    Description: >-
+      Numeric repository ID, required alongside GitHubOwnerId.
+      Find it with:  gh api repos/<owner>/<repo> --jq .id
+
+  CreateOIDCProvider:
+    Type: String
+    AllowedValues: ["true", "false"]
+    Default: "true"
+    Description: >-
+      Set false if the account already has the GitHub OIDC provider, since only
+      one may exist per account.
+
+Conditions:
+  ShouldCreateProvider: !Equals [!Ref CreateOIDCProvider, "true"]
+
+  # Pinning the numeric IDs is strictly stronger than matching on names: a
+  # repository that is renamed, deleted and recreated, or transferred keeps its
+  # name but not its ID, so an ID-qualified subject cannot be impersonated by
+  # re-registering the name. Where the organisation emits them, use them.
+  UseImmutableIds: !And
+    - !Not [!Equals [!Ref GitHubOwnerId, ""]]
+    - !Not [!Equals [!Ref GitHubRepoId, ""]]
+
+Resources:
+  # -- Terraform state ----------------------------------------------------
+  # Terraform 1.10+ locks natively against S3, so no DynamoDB lock table is
+  # needed. One less always-on resource.
+  StateBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub cosac-tfstate-${AWS::AccountId}-${AWS::Region}
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          # State files are small, but old versions accumulate across many
+          # deploy/destroy cycles. Keep a month of history, not forever.
+          - Id: expire-old-versions
+            Status: Enabled
+            NoncurrentVersionExpirationInDays: 30
+
+  StateBucketTLSOnly:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref StateBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Deny
+            Principal: "*"
+            Action: s3:*
+            Resource:
+              - !GetAtt StateBucket.Arn
+              - !Sub ${StateBucket.Arn}/*
+            Condition:
+              Bool:
+                aws:SecureTransport: false
+
+  # -- Record -------------------------------------------------------------
+  # The append-only decision ledger. Survives between demos deliberately: the
+  # record of what the flawed agent did is the artefact you present after the
+  # live run, so it must outlive the stack that produced it.
+  DecisionLedger:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      TableName: cosac-decision-ledger
+      BillingMode: PAY_PER_REQUEST # zero cost when idle
+      AttributeDefinitions:
+        - AttributeName: agent_id
+          AttributeType: S
+        - AttributeName: decision_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: agent_id
+          KeyType: HASH
+        - AttributeName: decision_id
+          KeyType: RANGE
+      SSESpecification:
+        SSEEnabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+
+  # -- Escalate -----------------------------------------------------------
+  ApprovalTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: cosac-approvals
+      DisplayName: COSAC agent escalations
+
+  # -- Agent images -------------------------------------------------------
+  # One repository. Both twins in a scenario run the SAME image tag -- that is
+  # the point of the demo, and sharing one repository makes it impossible to
+  # accidentally build them differently.
+  AgentRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: cosac-agents
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {
+            "rules": [
+              {
+                "rulePriority": 1,
+                "description": "Keep the last 5 images",
+                "selection": {
+                  "tagStatus": "any",
+                  "countType": "imageCountMoreThan",
+                  "countNumber": 5
+                },
+                "action": { "type": "expire" }
+              }
+            ]
+          }
+
+  # -- Authorize ----------------------------------------------------------
+  GitHubOIDCProvider:
+    Type: AWS::IAM::OIDCProvider
+    Condition: ShouldCreateProvider
+    Properties:
+      Url: https://token.actions.githubusercontent.com
+      ClientIdList:
+        - sts.amazonaws.com
+      ThumbprintList:
+        - ffffffffffffffffffffffffffffffffffffffff
+
+  # The plan role can read the account and nothing else. A plan runs on every
+  # pull request, including from a branch nobody has reviewed, so it must be
+  # incapable of mutating anything.
+  PlanRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: cosac-gha-plan
+      MaxSessionDuration: 3600
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:oidc-provider/token.actions.githubusercontent.com
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                token.actions.githubusercontent.com:aud: sts.amazonaws.com
+              StringLike:
+                token.actions.githubusercontent.com:sub: !If
+                  - UseImmutableIds
+                  - !Sub repo:${GitHubOrg}@${GitHubOwnerId}/${RepoName}@${GitHubRepoId}:*
+                  - !Sub repo:${GitHubOrg}/${RepoName}:*
+      ManagedPolicyArns:
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/ReadOnlyAccess
+      Policies:
+        - PolicyName: terraform-state
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # Native S3 locking needs write access to the lock file, so a
+              # plan cannot be given a read-only bucket. It is still confined
+              # to this one prefix and cannot touch the account otherwise.
+              - Effect: Allow
+                Action: [s3:GetObject, s3:PutObject, s3:DeleteObject]
+                Resource: !Sub ${StateBucket.Arn}/*
+              - Effect: Allow
+                Action: s3:ListBucket
+                Resource: !GetAtt StateBucket.Arn
+
+  # Reachable only from the protected lab-apply environment, which requires a
+  # human approval in GitHub before the job starts.
+  # Shared by the apply role and the teardown role. PowerUserAccess denies
+  # nearly all of IAM, so this is the only source of IAM permission for the
+  # pipeline -- and a destroy needs the same reach a create does.
+  ScopedIamPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: cosac-gha-scoped-iam
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          # PowerUserAccess denies nearly all of IAM, so this list is the
+          # only source of IAM permission for the pipeline. It needs the
+          # read actions too: Terraform refreshes a role's inline and
+          # attached policies on every plan, and a missing List* is an
+          # AccessDenied halfway through an apply rather than at the start.
+          - Effect: Allow
+            Action:
+              - iam:CreateRole
+              - iam:DeleteRole
+              - iam:GetRole
+              - iam:PassRole
+              - iam:UpdateAssumeRolePolicy
+              - iam:AttachRolePolicy
+              - iam:DetachRolePolicy
+              - iam:PutRolePolicy
+              - iam:DeleteRolePolicy
+              - iam:GetRolePolicy
+              - iam:ListRolePolicies
+              - iam:ListAttachedRolePolicies
+              - iam:ListInstanceProfilesForRole
+              - iam:ListRoleTags
+              - iam:TagRole
+              - iam:UntagRole
+            Resource: !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:role/cosac-*
+
+          # Instance profiles are a separate resource type, not covered by
+          # the role ARN above. Both scenarios need them: the hosts are
+          # driven through Systems Manager and so must carry a role.
+          - Effect: Allow
+            Action:
+              - iam:CreateInstanceProfile
+              - iam:DeleteInstanceProfile
+              - iam:GetInstanceProfile
+              - iam:AddRoleToInstanceProfile
+              - iam:RemoveRoleFromInstanceProfile
+              - iam:ListInstanceProfileTags
+              - iam:TagInstanceProfile
+              - iam:UntagInstanceProfile
+            Resource: !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:instance-profile/cosac-*
+
+          # Service-linked roles live under a path AWS controls, so they
+          # cannot be scoped to cosac-*. ELB and WAFv2 create theirs on
+          # first use. The action is already constrained by the service.
+          - Effect: Allow
+            Action: iam:CreateServiceLinkedRole
+            Resource: "*"
+            Condition:
+              StringEquals:
+                iam:AWSServiceName:
+                  - elasticloadbalancing.amazonaws.com
+                  - wafv2.amazonaws.com
+                  - guardduty.amazonaws.com
+          # The pipeline must never be able to rewrite its own authorisation.
+          - Effect: Deny
+            Action: iam:*
+            Resource:
+              - !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:role/cosac-gha-plan
+              - !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:role/cosac-gha-apply
+              - !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:role/cosac-gha-teardown
+
+  ApplyRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: cosac-gha-apply
+      MaxSessionDuration: 3600
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:oidc-provider/token.actions.githubusercontent.com
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                token.actions.githubusercontent.com:aud: sts.amazonaws.com
+                token.actions.githubusercontent.com:sub: !If
+                  - UseImmutableIds
+                  - !Sub repo:${GitHubOrg}@${GitHubOwnerId}/${RepoName}@${GitHubRepoId}:environment:lab-apply
+                  - !Sub repo:${GitHubOrg}/${RepoName}:environment:lab-apply
+      ManagedPolicyArns:
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/PowerUserAccess
+        - !Ref ScopedIamPolicy
+
+  # The nightly teardown, which runs unattended.
+  #
+  # It cannot use the apply role: that role's trust policy names exactly one
+  # subject, `...:environment:lab-apply`, and a scheduled job has no
+  # environment because there is nobody awake to approve it. The teardown was
+  # failing every night on sts:AssumeRoleWithWebIdentity for precisely that
+  # reason -- the Escalate gate doing its job against a caller that genuinely
+  # could not pass it.
+  #
+  # Widening the apply role to accept refs/heads/main would have fixed it and
+  # destroyed the point: any workflow on main could then apply without the
+  # human gate. So this is a separate identity, and its trust is narrower than
+  # the apply role's in the dimension that matters -- it may be assumed ONLY
+  # by nightly-teardown.yml, running on main. A new workflow, or an edit to
+  # this one on a branch, cannot borrow it.
+  TeardownRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: cosac-gha-teardown
+      MaxSessionDuration: 3600
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:oidc-provider/token.actions.githubusercontent.com
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                token.actions.githubusercontent.com:aud: sts.amazonaws.com
+                token.actions.githubusercontent.com:sub: !If
+                  - UseImmutableIds
+                  - !Sub repo:${GitHubOrg}@${GitHubOwnerId}/${RepoName}@${GitHubRepoId}:ref:refs/heads/main
+                  - !Sub repo:${GitHubOrg}/${RepoName}:ref:refs/heads/main
+              # The claim that does the real work: the role may be assumed
+              # only by THIS workflow file.
+              #
+              # Written to match the claim in BOTH shapes, because guessing
+              # which one GitHub sends cost three nights of teardowns. The
+              # subject above carries immutable numeric ids when the
+              # organisation enables them; job_workflow_ref does NOT, and a
+              # trust policy pinned to the id form simply never matches, so
+              # the role could not be assumed at all.
+              #
+              # The wildcards sit after a literal owner and repository: IAM
+              # refuses a job_workflow_ref that STARTS with one, reading that
+              # as scoped to all.
+              StringLike:
+                token.actions.githubusercontent.com:job_workflow_ref:
+                  !Sub ${GitHubOrg}*/${RepoName}*/.github/workflows/nightly-teardown.yml@refs/heads/main
+      ManagedPolicyArns:
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/PowerUserAccess
+        - !Ref ScopedIamPolicy
+
+  # Drives the demo: sends SSM commands to the attacker and victim hosts, and
+  # reads the scoreboard. Cannot create or modify infrastructure -- triggering
+  # a demo and deploying one are separate authorities on purpose.
+  DemoRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: cosac-gha-demo
+      MaxSessionDuration: 3600
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:oidc-provider/token.actions.githubusercontent.com
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                token.actions.githubusercontent.com:aud: sts.amazonaws.com
+              StringLike:
+                token.actions.githubusercontent.com:sub: !If
+                  - UseImmutableIds
+                  - !Sub repo:${GitHubOrg}@${GitHubOwnerId}/${RepoName}@${GitHubRepoId}:*
+                  - !Sub repo:${GitHubOrg}/${RepoName}:*
+      Policies:
+        - PolicyName: drive-the-demo
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ssm:SendCommand
+                  - ssm:GetCommandInvocation
+                  - ssm:ListCommandInvocations
+                  - ssm:ListCommands
+                  # A reset must be able to empty the command queue. An agent
+                  # that has been offline replays it on reconnect, which is
+                  # how a rebooted victim restarted its own compromise.
+                  - ssm:CancelCommand
+                  - ssm:DescribeInstanceInformation
+                Resource: "*"
+                Condition:
+                  StringEqualsIfExists:
+                    aws:ResourceTag/Project: cosac
+              # DescribeSecurityGroups is how a reset finds the group to put
+              # an instance back into. Its absence made `agent custodian ->
+              # reset` fail on its first call, every time, since the day it
+              # was written -- the old force-quarantine reset needed it too,
+              # to find the isolation group.
+              - Effect: Allow
+                Action:
+                  - ec2:DescribeInstances
+                  - ec2:DescribeTags
+                  - ec2:DescribeSecurityGroups
+                Resource: "*"
+              - Effect: Allow
+                Action: [dynamodb:Query, dynamodb:Scan]
+                Resource: !GetAtt DecisionLedger.Arn
+              - Effect: Allow
+                Action:
+                  - wafv2:GetIPSet
+                  - wafv2:ListIPSets
+                  - cloudwatch:GetMetricData
+                  - cloudwatch:GetMetricStatistics
+                Resource: "*"
+              # Break glass. The demo role may always reverse a block or force
+              # a quarantine, even though it may not create anything.
+              - Effect: Allow
+                Action: wafv2:UpdateIPSet
+                Resource: "*"
+              # RebootInstances is the reset's last resort. An SSM agent can
+              # stop answering while the box is fine -- seen on a victim at
+              # 20% CPU -- and a payload nothing can stop is a reset that
+              # cannot finish. A reboot needs no agent, and the payload is
+              # started by command rather than by user-data, so it stays dead.
+              - Effect: Allow
+                Action:
+                  - ec2:ModifyInstanceAttribute
+                  - ec2:RebootInstances
+                Resource: "*"
+                Condition:
+                  StringEquals:
+                    aws:ResourceTag/Project: cosac
+              # A reset must be able to undo everything the run produced,
+              # or the workflow path and the board's `R` are not the same
+              # reset -- which is worse than having only one of them.
+              - Effect: Allow
+                Action: dynamodb:DeleteItem
+                Resource: !GetAtt DecisionLedger.Arn
+              - Effect: Allow
+                Action: cloudwatch:PutMetricData
+                Resource: "*"
+                Condition:
+                  StringLike:
+                    cloudwatch:namespace: COSAC/*
+              # Archiving is how GuardDuty is told an incident is dealt with.
+              # Findings cannot be deleted, and this role cannot create,
+              # disable or delete a detector.
+              - Effect: Allow
+                Action:
+                  - guardduty:ListDetectors
+                  - guardduty:ListFindings
+                  - guardduty:ArchiveFindings
+                Resource: "*"
+
+  # --------------------------------------------------------------------
+  # The kill switch.
+  #
+  # An agent lab left running can spend real money on model calls without
+  # anybody noticing, so the stop must not depend on anybody remembering --
+  # and must not depend on GitHub either.
+  # It lives here, in the bootstrap, because a guard inside the thing it
+  # guards is not a guard: destroy the scenario stacks and their own timer
+  # goes with them.
+  #
+  # Every ten minutes it reads /cosac/<stack>/expires-at, which the deploy
+  # workflow writes. Past that moment, it deletes what costs money in that
+  # stack. It is a KILL, not a clean destroy -- Terraform state is left
+  # stale on purpose, and the log says so. Run the deploy workflow's
+  # destroy afterwards to tidy up.
+  # --------------------------------------------------------------------
+  ReaperRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: cosac-reaper
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: reap-the-lab
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:*
+              # Read the deadline, and stamp it spent so one expiry is not
+              # reaped every ten minutes for ever.
+              - Effect: Allow
+                Action: [ssm:GetParameter, ssm:PutParameter]
+                Resource: !Sub arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/cosac/*
+              # Describe is unscopeable; the destructive verbs are not.
+              - Effect: Allow
+                Action:
+                  - ec2:DescribeInstances
+                  - lambda:ListFunctions
+                  - elasticloadbalancing:DescribeLoadBalancers
+                  - bedrock-agentcore:ListAgentRuntimes
+                Resource: "*"
+              - Effect: Allow
+                Action: ec2:TerminateInstances
+                Resource: "*"
+                Condition:
+                  StringEquals:
+                    aws:ResourceTag/Project: cosac
+              # The shims are what reach Bedrock, so they die first and the
+              # spend stops within the minute.
+              - Effect: Allow
+                Action: [lambda:DeleteFunction, lambda:PutFunctionConcurrency]
+                Resource: !Sub arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:cosac-*
+              - Effect: Allow
+                Action: bedrock-agentcore:DeleteAgentRuntime
+                Resource: "*"
+              - Effect: Allow
+                Action: elasticloadbalancing:DeleteLoadBalancer
+                Resource: "*"
+
+  ReaperFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: cosac-reaper
+      Role: !GetAtt ReaperRole.Arn
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 120
+      Code:
+        ZipFile: |
+          """Delete the lab once its deadline has passed. See the stack."""
+          import datetime
+          import boto3
+
+          # stack -> (Scenario tag, function prefix, runtime prefix, ALB prefix)
+          STACKS = {
+              "scenario-a": ("a-warden", "cosac-warden-", "cosac_warden_", "cosac-a-"),
+              "scenario-b": ("b-custodian", "cosac-custodian-", "cosac_custodian_", "cosac-b-"),
+          }
+          ssm = boto3.client("ssm")
+          ec2 = boto3.client("ec2")
+          lam = boto3.client("lambda")
+          elb = boto3.client("elbv2")
+
+          def deadline(stack):
+              try:
+                  v = ssm.get_parameter(Name="/cosac/%s/expires-at" % stack)
+              except ssm.exceptions.ParameterNotFound:
+                  return None
+              v = v["Parameter"]["Value"]
+              if v.lower() in ("never", "off", ""):
+                  return None
+              return datetime.datetime.fromisoformat(v)
+
+          def handler(event, context):
+              now = datetime.datetime.now(datetime.timezone.utc)
+              killed = {}
+              for stack, (scen, fn_p, rt_p, lb_p) in STACKS.items():
+                  due = deadline(stack)
+                  if due is None or now < due:
+                      continue
+                  gone = []
+
+                  for page in lam.get_paginator("list_functions").paginate():
+                      for fn in page["Functions"]:
+                          if fn["FunctionName"].startswith(fn_p):
+                              lam.delete_function(FunctionName=fn["FunctionName"])
+                              gone.append(fn["FunctionName"])
+
+                  # Newer than the bundled boto3 on some runtimes; never let
+                  # it stop the parts that matter.
+                  try:
+                      core = boto3.client("bedrock-agentcore-control")
+                      for rt in core.list_agent_runtimes().get("agentRuntimes", []):
+                          if rt["agentRuntimeName"].startswith(rt_p):
+                              core.delete_agent_runtime(agentRuntimeId=rt["agentRuntimeId"])
+                              gone.append(rt["agentRuntimeName"])
+                  except Exception as exc:
+                      print("agentcore not reaped: %s" % exc)
+
+                  res = ec2.describe_instances(Filters=[
+                      {"Name": "tag:Scenario", "Values": [scen]},
+                      {"Name": "instance-state-name",
+                       "Values": ["pending", "running", "stopping", "stopped"]}])
+                  ids = [i["InstanceId"] for r in res["Reservations"] for i in r["Instances"]]
+                  if ids:
+                      ec2.terminate_instances(InstanceIds=ids)
+                      gone += ids
+
+                  for lb in elb.describe_load_balancers().get("LoadBalancers", []):
+                      if lb["LoadBalancerName"].startswith(lb_p):
+                          elb.delete_load_balancer(LoadBalancerArn=lb["LoadBalancerArn"])
+                          gone.append(lb["LoadBalancerName"])
+
+                  # Spent. Otherwise this runs again every ten minutes.
+                  ssm.put_parameter(Name="/cosac/%s/expires-at" % stack,
+                                    Value="never", Type="String", Overwrite=True)
+                  killed[stack] = gone
+                  print("REAPED %s (deadline %s): %s" % (stack, due.isoformat(), gone))
+                  print("Terraform state for %s is now stale. Run the deploy "
+                        "workflow with action=destroy to tidy up." % stack)
+
+              if not killed:
+                  print("nothing expired")
+              return killed
+
+  ReaperSchedule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: cosac-reaper
+      Description: Checks the lab's deadline every ten minutes.
+      ScheduleExpression: rate(10 minutes)
+      State: ENABLED
+      Targets:
+        - Id: reaper
+          Arn: !GetAtt ReaperFunction.Arn
+
+  ReaperInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt ReaperFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt ReaperSchedule.Arn
+
+Outputs:
+  StateBucketName:
+    Description: Terraform backend bucket. Set as TF_STATE_BUCKET.
+    Value: !Ref StateBucket
+
+  PlanRoleArn:
+    Description: Set as the AWS_PLAN_ROLE_ARN repository variable.
+    Value: !GetAtt PlanRole.Arn
+
+  ApplyRoleArn:
+    Description: Set as the AWS_APPLY_ROLE_ARN repository variable.
+    Value: !GetAtt ApplyRole.Arn
+
+  DemoRoleArn:
+    Description: Set as the AWS_DEMO_ROLE_ARN repository variable.
+    Value: !GetAtt DemoRole.Arn
+
+  TeardownRoleArn:
+    Description: Set as the AWS_TEARDOWN_ROLE_ARN repository variable.
+    Value: !GetAtt TeardownRole.Arn
+
+  LedgerTableName:
+    Value: !Ref DecisionLedger
+
+  ApprovalTopicArn:
+    Value: !Ref ApprovalTopic
+
+  AgentRepositoryUri:
+    Value: !GetAtt AgentRepository.RepositoryUri

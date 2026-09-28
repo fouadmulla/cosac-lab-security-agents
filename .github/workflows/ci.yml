@@ -1,0 +1,32 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  policy:
+    name: policy divergence
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: install
+        run: pip install -e ".[dev]"
+
+      - name: lint
+        run: ruff check agents tests demo
+
+      # The demo's central claim is that each pair of twins diverges on an
+      # identical input, and that the only difference is a config value. That
+      # is asserted here, so it is proven in CI rather than on stage.
+      - name: policy tests
+        run: pytest -v

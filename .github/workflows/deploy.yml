@@ -1,0 +1,230 @@
+# Steps 2 and 3 of the demo lifecycle: deploy (and destroy) a scenario stack.
+#
+# The bootstrap stack is not managed here. It is always on, costs almost
+# nothing, and is deployed by hand -- deliberately not by the pipeline it
+# authorises.
+#
+# This workflow follows TRACE itself:
+#   Authorize  OIDC, no static keys; plan and apply are separate roles
+#   Constrain  the plan role is read-only and cannot mutate the account
+#   Record     every plan is retained as an artifact
+#   Escalate   apply and destroy require lab-apply environment approval
+
+name: deploy
+
+on:
+  pull_request:
+    paths: ["infra/**", ".github/workflows/deploy.yml"]
+  workflow_dispatch:
+    inputs:
+      stack:
+        description: Which scenario stack
+        required: true
+        type: choice
+        options: [scenario-a, scenario-b]
+      action:
+        description: plan is safe; apply and destroy need approval
+        required: true
+        default: plan
+        type: choice
+        options: [plan, apply, destroy]
+      ttl_hours:
+        description: >-
+          Hours before the kill switch deletes this stack. 0 disables it;
+          only do that with somebody watching the account.
+        required: false
+        default: "2"
+        type: string
+
+permissions:
+  contents: read
+  id-token: write
+
+# Terraform keeps ONE state lock per stack, so two runs touching the same
+# stack cannot overlap -- and they do overlap, because opening a PR that
+# touches infra/** starts a plan while somebody is dispatching an apply.
+# Seen exactly that way:
+#
+#   Error acquiring the state lock ... Operation: OperationTypePlan
+#
+# Queue them instead. Never cancel-in-progress here: a half-applied stack is
+# worse than a slow one.
+concurrency:
+  group: terraform-${{ github.event.inputs.stack || 'scenario-a' }}
+  cancel-in-progress: false
+
+env:
+  TF_VERSION: "1.13.3"
+  AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+
+jobs:
+  validate:
+    name: fmt / validate / scan
+    runs-on: ubuntu-latest
+    strategy:
+      # Report both stacks even when one fails; a reviewer should see the
+      # whole picture, not whichever stack happened to fail first.
+      fail-fast: false
+      matrix:
+        stack: [scenario-a, scenario-b]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - run: terraform -chdir=infra/stacks/${{ matrix.stack }} fmt -check -recursive
+
+      - run: terraform -chdir=infra/stacks/${{ matrix.stack }} init -backend=false
+
+      - run: terraform -chdir=infra/stacks/${{ matrix.stack }} validate
+
+      # A security demo repository that shipped unscanned IaC would be a poor
+      # advertisement for its own thesis. Hard fail, with every exception
+      # listed and justified in .checkov.yml -- never waived here.
+      - name: checkov
+        uses: bridgecrewio/checkov-action@master
+        with:
+          directory: infra/stacks/${{ matrix.stack }}
+          framework: terraform
+          config_file: .checkov.yml
+          soft_fail: false
+
+  plan:
+    name: plan
+    needs: validate
+    if: vars.AWS_PLAN_ROLE_ARN != ''
+    runs-on: ubuntu-latest
+    environment: lab-plan
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_PLAN_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      # Terraform reads this zip with `data "local_file"`, and .build/ is
+      # gitignored, so without this step every plan fails on a file that
+      # exists only on the machine that last built it. The package vendors
+      # boto3, which AgentCore does not provide.
+      - name: build the agent package
+        run: |
+          bash demo/build-agent-package.sh \
+            "$GITHUB_WORKSPACE/infra/stacks/${{ inputs.stack || 'scenario-a' }}/.build/agentcore.zip"
+
+      - name: init
+        working-directory: infra/stacks/${{ inputs.stack || 'scenario-a' }}
+        run: |
+          terraform init \
+            -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}" \
+            -backend-config="region=${{ env.AWS_REGION }}"
+
+      - name: plan
+        working-directory: infra/stacks/${{ inputs.stack || 'scenario-a' }}
+        run: terraform plan -out=tfplan -no-color | tee plan.txt
+
+      - name: record the plan
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfplan-${{ inputs.stack || 'scenario-a' }}-${{ github.sha }}
+          path: infra/stacks/${{ inputs.stack || 'scenario-a' }}/plan.txt
+          retention-days: 30
+
+  apply:
+    name: ${{ inputs.action }}
+    needs: plan
+    if: github.event_name == 'workflow_dispatch' && inputs.action != 'plan' && vars.AWS_APPLY_ROLE_ARN != ''
+    runs-on: ubuntu-latest
+    # The Escalate gate, and the only place in this repository where a human
+    # is required.
+    environment: lab-apply
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_APPLY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      # Terraform reads this zip with `data "local_file"`, and .build/ is
+      # gitignored, so without this step every plan fails on a file that
+      # exists only on the machine that last built it. The package vendors
+      # boto3, which AgentCore does not provide.
+      - name: build the agent package
+        run: |
+          bash demo/build-agent-package.sh \
+            "$GITHUB_WORKSPACE/infra/stacks/${{ inputs.stack }}/.build/agentcore.zip"
+
+      - name: init
+        working-directory: infra/stacks/${{ inputs.stack }}
+        run: |
+          terraform init \
+            -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}" \
+            -backend-config="region=${{ env.AWS_REGION }}"
+
+      - name: apply
+        if: inputs.action == 'apply'
+        working-directory: infra/stacks/${{ inputs.stack }}
+        run: terraform apply -auto-approve
+
+      - name: destroy
+        if: inputs.action == 'destroy'
+        working-directory: infra/stacks/${{ inputs.stack }}
+        run: terraform destroy -auto-approve
+
+      # The kill switch reads this, and nothing else does. Written AFTER the
+      # apply, so a failed deploy cannot arm a timer against a stack that was
+      # never built -- and so a re-apply extends the clock rather than
+      # inheriting the last one.
+      - name: arm the kill switch
+        if: inputs.action == 'apply'
+        run: |
+          set -euo pipefail
+          hours="${{ inputs.ttl_hours }}"
+          if [ -z "$hours" ] || [ "$hours" = "0" ] || [ "$hours" = "off" ]; then
+            aws ssm put-parameter --name "/cosac/${{ inputs.stack }}/expires-at" \
+              --type String --overwrite --value never >/dev/null
+            echo "::warning::${{ inputs.stack }} has NO kill switch. It will run until somebody destroys it."
+            echo "- Kill switch: **disabled**" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          # date(1) refuses "+0.5 hours", so work in whole minutes. A half
+          # hour is a reasonable thing to ask for, and 0.1 is how you test
+          # the kill switch without waiting two hours for it.
+          mins=$(awk -v h="$hours" 'BEGIN { printf "%d", (h * 60) + 0.5 }')
+          if [ "$mins" -lt 1 ]; then mins=1; fi
+          at=$(date -u -d "+${mins} minutes" +%Y-%m-%dT%H:%M:%S+00:00)
+          aws ssm put-parameter --name "/cosac/${{ inputs.stack }}/expires-at" \
+            --type String --overwrite --value "$at" >/dev/null
+          echo "kill switch armed: $at (${mins} minutes)"
+          echo "- Kill switch: deletes this stack at **$at** (in ${mins} min)" >> "$GITHUB_STEP_SUMMARY"
+
+      # Nothing left to kill, so nothing left to remember.
+      - name: disarm the kill switch
+        if: inputs.action == 'destroy'
+        run: |
+          aws ssm delete-parameter --name "/cosac/${{ inputs.stack }}/expires-at" 2>/dev/null \
+            && echo "kill switch disarmed" || echo "no kill switch was set"
+
+      # The endpoints and instance ids the demo workflows need, printed where
+      # the operator can find them without opening the console.
+      - name: outputs
+        if: inputs.action == 'apply'
+        working-directory: infra/stacks/${{ inputs.stack }}
+        run: |
+          {
+            echo "## ${{ inputs.stack }} deployed"
+            echo '```'
+            terraform output
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

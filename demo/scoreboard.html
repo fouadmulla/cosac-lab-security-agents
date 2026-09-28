@@ -1,0 +1,869 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>COSAC Scoreboard</title>
+<style>
+  /* Built for a projector at the back of a room, not a laptop on a desk.
+     Everything is sized off --u so the whole board scales with the viewport,
+     and the palette is high-contrast dark because that is what survives a
+     badly calibrated projector in a bright room. */
+  :root {
+    --u: clamp(11px, 1.05vw, 20px);
+    --bg: #07090e;
+    --panel: #0f131c;
+    --panel-2: #141926;
+    --line: #232b3d;
+    --ink: #eef2ff;
+    --dim: #7e8aa6;
+    --good: #2ee6a8;
+    --bad: #ff4d6a;
+    --warn: #ffb245;
+    --accent: #6f9cff;
+    --mono: ui-monospace, "SF Mono", "Cascadia Mono", Menlo, Consolas, monospace;
+    --sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Inter, sans-serif;
+  }
+
+  * { box-sizing: border-box; }
+
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--ink);
+    font-family: var(--sans);
+    height: 100vh;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+
+  /* ---- header ---------------------------------------------------------- */
+  header {
+    display: flex;
+    align-items: center;
+    gap: calc(var(--u) * 1.4);
+    padding: calc(var(--u) * 0.9) calc(var(--u) * 1.6);
+    border-bottom: 1px solid var(--line);
+    background: linear-gradient(180deg, #0d1119, #090c12);
+  }
+  .brand { font-size: calc(var(--u) * 1.15); font-weight: 700; letter-spacing: .14em; text-transform: uppercase; }
+  .brand span { color: var(--dim); font-weight: 500; }
+
+  .tabs { display: flex; gap: calc(var(--u) * 0.5); margin-left: auto; }
+  .tab {
+    font: 600 calc(var(--u) * 0.95)/1 var(--sans);
+    letter-spacing: .06em;
+    padding: calc(var(--u) * 0.55) calc(var(--u) * 1.1);
+    border-radius: 999px;
+    border: 1px solid var(--line);
+    background: transparent;
+    color: var(--dim);
+    cursor: pointer;
+  }
+  .tab[aria-selected="true"] { background: var(--accent); border-color: var(--accent); color: #05070c; }
+
+  .clock { font: 500 calc(var(--u) * 0.9)/1 var(--mono); color: var(--dim); }
+  .pulse { width: .6em; height: .6em; border-radius: 50%; background: var(--good); display: inline-block; margin-right: .5em; animation: blink 2s infinite; }
+  .pulse.stale { background: var(--warn); }
+  @keyframes blink { 50% { opacity: .25; } }
+
+
+  /* ---- board ----------------------------------------------------------- */
+  main { flex: 1; display: grid; grid-template-rows: 1fr auto auto; min-height: 0; }
+
+  .twins { display: grid; grid-template-columns: 1fr 1fr; gap: 1px; background: var(--line); min-height: 0; }
+
+  .twin {
+    background: var(--panel);
+    padding: calc(var(--u) * 1.3) calc(var(--u) * 1.6);
+    display: flex;
+    flex-direction: column;
+    gap: calc(var(--u) * 0.9);
+    min-height: 0;
+    position: relative;
+    transition: background .5s;
+  }
+  .twin.is-bad { background: linear-gradient(180deg, #17090f, var(--panel)); }
+  .twin.is-good { background: linear-gradient(180deg, #08160f, var(--panel)); }
+
+  .twin-name { font-size: calc(var(--u) * 1.9); font-weight: 700; letter-spacing: .04em; }
+  .twin-cfg {
+    font: 600 calc(var(--u) * 0.85)/1 var(--mono);
+    color: var(--dim);
+    margin-top: calc(var(--u) * 0.2);
+  }
+  .twin-cfg em { font-style: normal; color: var(--warn); }
+
+  /* Fill the panel rather than bunching at the top: on a 16:9 projector the
+     four rows otherwise leave a dead band across the middle of the board. */
+  .rows { display: flex; flex-direction: column; justify-content: space-evenly; flex: 1; min-height: 0; margin: 0; }
+  .row { display: flex; justify-content: space-between; align-items: baseline; gap: var(--u); }
+  .row dt { color: var(--dim); font-size: calc(var(--u) * 0.95); }
+  .row dd { margin: 0; font: 600 calc(var(--u) * 1.15)/1.2 var(--mono); text-align: right; word-break: break-all; }
+  .row dd.bad { color: var(--bad); }
+  .row dd.good { color: var(--good); }
+  .row dd.dim { color: var(--dim); font-weight: 400; }
+
+  /* The one number the audience reads from the back row. */
+  .verdict { margin-top: auto; padding-top: calc(var(--u) * 0.8); border-top: 1px solid var(--line); }
+  .verdict-label { font-size: calc(var(--u) * 0.85); color: var(--dim); letter-spacing: .12em; text-transform: uppercase; }
+  .verdict-value {
+    font: 800 calc(var(--u) * 3.1)/1.05 var(--sans);
+    letter-spacing: -.02em;
+    margin-top: calc(var(--u) * 0.3);
+    display: flex; align-items: center; gap: .35em;
+  }
+  .verdict-value.good { color: var(--good); }
+  .verdict-value.bad { color: var(--bad); }
+  .verdict-value.idle { color: var(--dim); }
+  .verdict-value.warn { color: var(--warn); }
+  .dot { width: .42em; height: .42em; border-radius: 50%; background: currentColor; flex: none; }
+  .verdict-value.bad .dot { animation: alarm 1.1s infinite; }
+  @keyframes alarm { 50% { opacity: .2; } }
+  .verdict-sub { color: var(--dim); font-size: calc(var(--u) * 0.9); margin-top: calc(var(--u) * 0.35); }
+
+  /* ---- approvals -------------------------------------------------------
+     The agent can ask, but it cannot answer. This band is where a human does,
+     and the ageing timer is the point of it: an unanswered request is not a
+     neutral state, it is the attacker's window staying open. */
+  /* Two columns, aligned with the twins below, so a request sits directly
+     above the agent making it. A full-width banner left the audience
+     guessing which side was asking. */
+  .approvals { display: grid; grid-template-columns: 1fr 1fr; gap: 1px; background: var(--line); }
+  .approvals:empty { display: none; }
+  .ask-col { background: var(--panel-2); display: flex; flex-direction: column; gap: 1px; min-width: 0; }
+  .ask-col:empty { background: var(--panel-2); }
+  .ask-more {
+    background: var(--panel-2);
+    padding: calc(var(--u) * 0.55) calc(var(--u) * 1.5);
+    color: var(--dim);
+    font-size: calc(var(--u) * 0.9);
+  }
+
+  .ask {
+    background: linear-gradient(180deg, #1d1508, #12161f 140%);
+    border-top: calc(var(--u) * 0.28) solid var(--warn);
+    padding: calc(var(--u) * 0.7) calc(var(--u) * 1.2);
+    display: flex; align-items: center; gap: calc(var(--u) * 0.9);
+    animation: slide .4s ease-out both;
+    min-width: 0;
+  }
+  .ask.is-answered { border-top-color: var(--good); background: linear-gradient(180deg, #08160f, #12161f 140%); }
+  .ask-body { flex: 1; min-width: 0; }
+  .ask-head { display: flex; align-items: baseline; gap: .8em; flex-wrap: wrap; }
+  .ask-who { font: 700 calc(var(--u) * 1.15)/1.2 var(--sans); }
+  .ask-what { color: var(--warn); font: 600 calc(var(--u) * 0.95)/1.2 var(--sans); letter-spacing: .05em; text-transform: uppercase; }
+  .ask-detail { color: var(--dim); font-size: calc(var(--u) * 0.85); margin-top: calc(var(--u) * 0.25);
+                overflow: hidden; text-overflow: ellipsis; }
+  .ask-detail b { color: var(--ink); font-family: var(--mono); font-weight: 600; }
+
+  .ask-age { text-align: right; flex: none; }
+  .ask-age-value { font: 800 calc(var(--u) * 1.45)/1 var(--mono); color: var(--warn); }
+  .ask-age-label { font-size: calc(var(--u) * 0.75); color: var(--dim); letter-spacing: .12em; text-transform: uppercase; margin-top: .3em; }
+
+  .ask-actions { display: flex; gap: calc(var(--u) * 0.6); flex: none; }
+  .ask-actions button {
+    font: 700 calc(var(--u) * 1)/1 var(--sans);
+    letter-spacing: .04em;
+    padding: calc(var(--u) * 0.55) calc(var(--u) * 1.05);
+    border-radius: calc(var(--u) * 0.4);
+    border: 1px solid transparent;
+    cursor: pointer;
+  }
+  .btn-approve { background: var(--good); color: #04120c; }
+  .btn-deny { background: transparent; border-color: var(--bad); color: var(--bad); }
+  .ask-actions button:disabled { opacity: .45; cursor: default; }
+
+  .ask-done { font: 700 calc(var(--u) * 1.1)/1 var(--sans); color: var(--good); flex: none; }
+
+  /* ---- explainer ------------------------------------------------------- */
+  .explain { background: var(--panel-2); border-top: 1px solid var(--line); display: grid; grid-template-columns: 1fr 1fr; gap: 1px; }
+  .explain > div { background: var(--panel-2); padding: calc(var(--u) * 0.95) calc(var(--u) * 1.6); min-height: 0; }
+  .explain h2 {
+    margin: 0 0 calc(var(--u) * 0.5);
+    font-size: calc(var(--u) * 0.8);
+    letter-spacing: .14em;
+    text-transform: uppercase;
+    color: var(--dim);
+    font-weight: 600;
+  }
+  .mech { font-size: calc(var(--u) * 1); color: var(--ink); line-height: 1.5; }
+  .mech code { font-family: var(--mono); color: var(--accent); }
+
+  .feed { list-style: none; margin: 0; padding: 0; max-height: calc(var(--u) * 6.6); overflow: hidden; }
+  .feed li { display: flex; gap: .7em; padding: calc(var(--u) * 0.16) 0; font-size: calc(var(--u) * 0.95); line-height: 1.4; animation: slide .45s ease-out both; }
+  @keyframes slide { from { opacity: 0; transform: translateY(-.4em); } }
+  .feed time { font-family: var(--mono); color: var(--dim); flex: none; font-size: calc(var(--u) * 0.85); padding-top: .12em; }
+  .feed .good { color: var(--good); }
+  .feed .bad  { color: var(--bad); }
+  .feed .info { color: var(--ink); }
+
+  .waiting { display: grid; place-items: center; height: 100%; color: var(--dim); font-size: calc(var(--u) * 1.3); text-align: center; line-height: 1.7; }
+  [hidden] { display: none !important; }
+
+  /* A reset takes a minute or two of real GitHub Actions. The board must not
+     narrate a half-reset lab underneath it, so it covers itself until the lab
+     itself says it is done. */
+  .curtain { position: fixed; inset: 0; z-index: 50; background: rgba(8,10,14,.97);
+             display: grid; place-items: center; }
+  .curtain .inner { width: min(46em, 86vw); }
+  .curtain h2 { font-size: calc(var(--u) * 1.9); letter-spacing: .02em; margin: 0 0 .2em; }
+  .curtain .sub { color: var(--dim); font-size: calc(var(--u) * 1.05); margin-bottom: 1.6em; }
+  .curtain ol { list-style: none; margin: 0; padding: 0; display: grid; gap: .85em; }
+  .curtain li { display: grid; grid-template-columns: 1.6em 1fr; align-items: baseline;
+                font-size: calc(var(--u) * 1.15); }
+  .curtain .mark { font-family: var(--mono); }
+  .curtain .note { display: block; color: var(--dim); font-size: calc(var(--u) * .9);
+                   font-family: var(--mono); margin-top: .15em; }
+  .curtain .running .mark { color: var(--warn); }
+  .curtain .done .mark    { color: var(--good); }
+  .curtain .failed .mark,
+  .curtain .failed        { color: var(--bad); }
+  .curtain .err { margin-top: 1.6em; color: var(--bad); font-size: calc(var(--u) * 1.05); }
+  .curtain .err b { display: block; margin-bottom: .3em; }
+  .curtain .dismiss { margin-top: 1.2em; color: var(--dim); font-size: calc(var(--u) * .9); }
+
+  @media (max-width: 900px) {
+    .twins, .explain { grid-template-columns: 1fr; }
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="brand">COSAC <span>· agentic security</span></div>
+  <div class="tabs" role="tablist">
+    <button class="tab" role="tab" data-scene="a" aria-selected="true">1 · Warden</button>
+    <button class="tab" role="tab" data-scene="b" aria-selected="false">2 · Custodian</button>
+  </div>
+  <div class="clock"><span class="pulse" id="pulse"></span><span id="clock">--:--:--</span></div>
+</header>
+
+<div class="curtain" id="curtain" hidden>
+  <div class="inner">
+    <h2>Resetting the lab</h2>
+    <div class="sub" id="curtain-sub">Running the same workflows the runbook documents.</div>
+    <ol id="curtain-steps"></ol>
+    <div class="err" id="curtain-err" hidden></div>
+  </div>
+</div>
+
+<main>
+  <div class="twins">
+    <section class="twin" id="twin-left"></section>
+    <section class="twin" id="twin-right"></section>
+  </div>
+
+  <div class="approvals" id="approvals">
+    <div class="ask-col" id="ask-left"></div>
+    <div class="ask-col" id="ask-right"></div>
+  </div>
+
+  <div class="explain">
+    <div>
+      <h2>What is happening underneath</h2>
+      <div class="mech" id="mech"></div>
+    </div>
+    <div>
+      <h2>Live</h2>
+      <ul class="feed" id="feed"></ul>
+    </div>
+  </div>
+</main>
+
+<script>
+// The two scenarios differ only in what they measure, so the board is one
+// renderer driven by a description of each scene rather than two pages.
+const SCENES = {
+  a: {
+    mech: 'The attacker is knocking from <b>18 real addresses</b> spread across three ' +
+          'neighbouring blocks. Your responders sit in the block <em>between</em> them. ' +
+          'Banning each address is safe. Banning the whole range is tidier — and ' +
+          'takes your own security team offline with it.',
+    render: (d) => COLUMNS.map((k) => {
+      const t = d.a.twins[k];
+      const wide = t.covered > 1;
+      const expires = t.profile === 'enforcing';
+      const online = t.responder === 1;
+      const reporting = t.responder !== null;
+      return {
+        name: t.label,
+        cfg: `WARDEN_POLICY_PROFILE = <em>${t.profile}</em>`,
+        tone: !t.deployed ? '' : (wide ? 'bad' : (t.entry_count ? 'good' : '')),
+        rows: [
+          ['Addresses banned', t.entry_count || '—', ''],
+          ['Widest single ban', t.widest || 'none yet', wide ? 'bad' : 'dim'],
+          ['Addresses that covers', t.covered > 1 ? t.covered.toLocaleString() : (t.entry_count ? '1 each' : '—'), wide ? 'bad' : 'good'],
+          // Whether an entry expires is decided by the PROFILE, not by how
+          // wide it is: the enforcing policy stamps a TTL on everything it
+          // allows, the legacy one never stamps anything. Reading it off the
+          // width showed 'yes, 60 min' under warden-b, which is the opposite
+          // of true and is the single null that turns a mistake into an
+          // outage.
+          ['Bans expire on their own',
+            !t.deployed ? '—' : (expires ? 'yes, 60 min' : 'no'),
+            expires ? 'good' : 'bad'],
+        ],
+        verdictLabel: 'Your responders',
+        verdict: !reporting ? 'standing by' : (online ? 'still working' : 'locked out'),
+        verdictTone: !reporting ? 'idle' : (online ? 'good' : 'bad'),
+        verdictSub: t.hits_protected
+          ? 'the ban covers the responders’ own block'
+          : (online ? 'they can still reach the site to investigate' : ''),
+      };
+    }),
+  },
+  b: {
+    mech: 'The machine is copying files out continuously. Unplugging it from the network ' +
+          'stops that instantly and is completely reversible. One agent is allowed to do ' +
+          'it; the other must ask a human first — and nobody is answering. ' +
+          'The counter below is <b>data exfiltrated × time spent waiting</b>.',
+    render: (d) => COLUMNS.map((k) => {
+      const t = d.b.twins[k];
+      const mb = (t.bytes / 1048576);
+
+      // Waiting on a human means THIS twin has a request outstanding. Derived
+      // from containment it said "yes" for the non-blocking twin, which never
+      // asks anyone for anything -- the panel was contradicting the profile
+      // printed directly above it.
+      const waiting = (d.approvals || []).some((x) => x.agent_id === t.label);
+
+      // Containment is the fact. Everything else is measured from the
+      // samples, and when the machine is unplugged the samples do not get a
+      // vote: the last datapoint often lands just after the security group
+      // changes, and the board went on saying "still climbing" over a
+      // machine that was already off the network.
+      const f = observe(t.label, t.bytes, t.contained);
+
+      return {
+        name: t.label,
+        cfg: `CUSTODIAN_ESCALATION_PROFILE = <em>${t.profile}</em>`,
+        tone: !t.deployed ? '' : (t.contained ? 'good' : 'bad'),
+        liveId: t.deployed ? t.label : '',
+        rows: [
+          ['Break-in detected', d.b.findings ? 'yes' : 'not yet', d.b.findings ? 'good' : 'dim'],
+          ['Machine unplugged', t.deployed ? (t.contained ? 'yes' : 'no') : '—',
+            t.contained ? 'good' : 'bad'],
+          ['Waiting on a human', !t.deployed ? '—' : (waiting ? 'yes' : 'no'),
+            waiting ? 'bad' : 'good'],
+          ['Network state', t.group ? t.group.replace('cosac-b-', '') : '—', 'dim'],
+        ],
+        verdictLabel: 'Data exfiltrated',
+        verdict: t.deployed ? megabytes(f.shown) : 'standing by',
+        verdictTone: !t.deployed ? 'idle' : flowTone(f),
+        verdictSub: !t.deployed ? '' : flowSub(f),
+      };
+    }),
+  },
+};
+
+// Natural order. A is the flawed twin BY NAME, so reading left to right
+// already shows the damage first and lets B answer it. Reordering the
+// columns achieved the same thing, but left the board disagreeing with the
+// resource names in the console -- which is worse than either.
+const COLUMNS = ['a', 'b'];
+
+let scene = 'a';
+let last = null;
+
+// -- the leak, as a rate rather than a series of jumps ----------------------
+//
+// The victim publishes roughly every five seconds and CloudWatch serves it a
+// moment later, so the counter can only ever arrive in steps. Reading those
+// steps literally produced a number that sat still and then jumped, and a
+// verdict that flickered between "climbing" and "not moving" several times a
+// minute -- which reads, correctly, as a broken board.
+//
+// So the samples are used for what they are good for: measuring a RATE. The
+// number on screen is then carried forward from the last real sample at that
+// measured rate, ten times a second, and corrected the moment the next real
+// sample lands. Between two samples it is a projection; at every sample it is
+// the truth again, and the rate it moves at is one this lab actually
+// achieved, printed underneath in KB/s so nobody has to take it on faith.
+//
+// It does not invent a leak. With no rise between samples the rate decays,
+// and after STALL_MS with nothing new it stops dead.
+const flow = new Map();
+
+// How long without a new number before the leak is called stopped. Measured
+// from the samples rather than fixed: a constant shorter than the gap between
+// samples reports a stall that is only the board blinking. It was 45s against
+// a feed that arrived once a minute, so it fired every single minute.
+const STALL_FLOOR_MS = 30000;
+
+function stallWindow(f) {
+  const h = f.history || [];
+  if (h.length < 2) return STALL_FLOOR_MS;
+  const gap = (h[h.length - 1].t - h[0].t) / (h.length - 1);
+  return Math.max(STALL_FLOOR_MS, gap * 3);
+}
+const WINDOW_MS = 20000;  // how much history the rate is measured over
+
+function observe(label, bytes, contained) {
+  const now = Date.now();
+  let f = flow.get(label);
+
+  if (!f) {
+    f = { bytes, at: now, rate: 0, shown: bytes, lastRise: 0, contained,
+          history: [{ t: now, b: bytes }] };
+    flow.set(label, f);
+    return f;
+  }
+
+  f.contained = contained;
+
+  if (bytes < f.bytes) {
+    // A reset zeroed the metric. Start over rather than projecting from a
+    // number that no longer exists.
+    f.history = [];
+    f.rate = 0;
+    f.lastRise = 0;
+    f.shown = bytes;
+  }
+
+  if (bytes !== f.bytes) {
+    // The anchor moves only when the NUMBER moves. Moving it on every poll
+    // measured the gap since the last poll rather than since the last
+    // increase, and the board polls more often than CloudWatch serves a new
+    // datapoint -- so the rate came out a clean multiple of the truth.
+    if (bytes > f.bytes) f.lastRise = now;
+    f.bytes = bytes;
+    f.at = now;
+    f.history.push({ t: now, b: bytes });
+  }
+
+  // Rate over a window rather than between the last two samples. One late
+  // poll or one bunched-up pair of datapoints then cannot set the rate on
+  // its own: measured in rehearsal, the two-sample estimate opened at 1.5x
+  // the real figure and took a minute of smoothing to come down.
+  const cutoff = now - WINDOW_MS;
+  while (f.history.length > 2 && f.history[0].t < cutoff) f.history.shift();
+
+  const first = f.history[0];
+  const last = f.history[f.history.length - 1];
+  const seconds = (last.t - first.t) / 1000;
+  f.rate = seconds >= 1 ? Math.max(0, (last.b - first.b) / seconds) : 0;
+
+  if (contained) f.rate = 0;          // unplugged: nothing more is leaving
+  if (f.shown < f.bytes) f.shown = f.bytes;
+  return f;
+}
+
+function leaking(f) {
+  return !f.contained && f.rate > 0 && Date.now() - f.lastRise < stallWindow(f);
+}
+
+function flowTone(f) {
+  if (f.contained) return 'good';     // green means contained, and only that
+  return leaking(f) ? 'bad' : 'warn';
+}
+
+function measuredFor(f) {
+  const h = f.history || [];
+  return h.length > 1 ? h[h.length - 1].t - h[0].t : 0;
+}
+
+function flowSub(f) {
+  if (f.contained) return 'stopped here';
+  if (!leaking(f)) return `no new data for ${Math.round(stallWindow(f) / 1000)}s`;
+  // Quoting a rate measured over four seconds is quoting noise. Individual
+  // intervals in rehearsal ranged 60-95 KB/s around a true 76, because the
+  // board's polls and CloudWatch's datapoints do not line up.
+  if (measuredFor(f) < 10000) return 'exfiltration in progress · measuring rate';
+  return `leaving at ${(f.rate / 1024).toFixed(1)} KB/s`;
+}
+
+// Two decimals. At the ~18 KB/s this lab really achieves the second decimal
+// turns over about twice a second, which is movement you can see from the
+// back of a room -- where four decimals were a blur of digits nobody could
+// read, and the number stopped looking like a quantity.
+function megabytes(bytes) {
+  return (bytes / 1048576).toFixed(2) + ' MB';
+}
+
+// Ten times a second, carry each counter forward and repaint just the number.
+// The panel around it is left alone -- rebuilding it at this rate would fight
+// the poll and make the whole board flicker.
+setInterval(() => {
+  if (scene !== 'b') return;
+  const now = Date.now();
+
+  for (const [label, f] of flow) {
+    if (leaking(f)) {
+      // Carried forward from the last real sample, but never more than about
+      // one sample interval ahead of it -- so the projection cannot run away
+      // between two slow polls, and the next real datapoint always catches
+      // up rather than yanking the number back.
+      const gap = Math.max(3000, f.history.length > 1
+        ? (f.history[f.history.length - 1].t - f.history[0].t) / (f.history.length - 1)
+        : 5000);
+      const ahead = Math.min(now - f.at, gap * 1.5);
+      const projected = f.bytes + f.rate * (ahead / 1000);
+      // Forward only. Bytes leaving a machine do not come back, and a
+      // counter that ticks backwards on a projector reads as a broken board
+      // rather than as an honest correction.
+      f.shown = Math.max(f.shown, projected);
+    } else if (f.shown < f.bytes) {
+      f.shown = f.bytes;
+    }
+
+    const n = document.getElementById(`n-${label}`);
+    if (n) n.textContent = megabytes(f.shown);
+
+    const v = document.getElementById(`v-${label}`);
+    if (v) v.className = `verdict-value ${flowTone(f)}`;
+
+    const sub = document.getElementById(`s-${label}`);
+    if (sub) sub.textContent = flowSub(f);
+  }
+}, 100);
+
+document.querySelectorAll('.tab').forEach((btn) => {
+  btn.addEventListener('click', () => select(btn.dataset.scene));
+});
+addEventListener('keydown', (e) => {
+  if (e.key === '1') select('a');
+  if (e.key === '2') select('b');
+  if (e.key === 'f') document.documentElement.requestFullscreen?.();
+  // lower-case r clears the board; shift-R also puts the lab back
+  if (e.key === 'r') doReset('board');
+  if (e.key === 'R') doReset('all');
+  // Only dismisses a FAILED reset. While one is in flight the curtain is not
+  // a dialog to be closed -- the board underneath it is not telling the truth
+  // yet, and Esc would put a half-reset lab back on the projector.
+  if (e.key === 'Escape' && last?.reset && !last.reset.active) {
+    document.getElementById('curtain').hidden = true;
+  }
+});
+
+// Everything the board remembers lives in these, so a reset has to clear them
+// too -- otherwise a second run would show stale cards and say nothing new.
+let resetting = false;
+
+async function doReset(scope) {
+  if (resetting) return;
+  resetting = true;
+  try {
+    await fetch('/api/reset', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ scope }),
+    });
+    document.getElementById('ask-left').innerHTML = '';
+    document.getElementById('ask-right').innerHTML = '';
+    document.getElementById('feed').innerHTML = '';
+    askEls.clear();
+    answered = new Set();
+    shown.clear();
+    flow.clear();
+    if (scope === 'all') {
+      // Up immediately, on the keystroke. The first poll that carries the
+      // real steps is a few seconds away, and a board that keeps narrating
+      // the old run in the meantime is exactly what this is here to stop.
+      curtain({ active: true, steps: [{ label: 'asking GitHub to run the reset',
+                                        state: 'running', note: '' }] });
+    }
+    await tick();
+  } catch { /* leave the board as it was */ }
+  resetting = false;
+}
+
+function select(next) {
+  scene = next;
+  document.querySelectorAll('.tab').forEach((b) =>
+    b.setAttribute('aria-selected', String(b.dataset.scene === next)));
+  // Cards belong to a scenario, so drop the ones that are no longer on screen
+  // and let the redraw rebuild whatever belongs here.
+  document.getElementById('ask-left').innerHTML = '';
+  document.getElementById('ask-right').innerHTML = '';
+  document.getElementById('feed').innerHTML = '';
+  askEls.clear();
+  shown.clear();
+  if (last) draw(last);
+}
+
+function panel(p) {
+  const rows = p.rows.map(([k, v, tone]) =>
+    `<div class="row"><dt>${k}</dt><dd class="${tone || ''}">${v}</dd></div>`).join('');
+  return `
+    <div>
+      <div class="twin-name">${p.name}</div>
+      <div class="twin-cfg">${p.cfg}</div>
+    </div>
+    <dl class="rows">${rows}</dl>
+    <div class="verdict">
+      <div class="verdict-label">${p.verdictLabel}</div>
+      <div class="verdict-value ${p.verdictTone}" ${p.liveId ? `id="v-${p.liveId}"` : ''}>
+        <span class="dot"></span><span ${p.liveId ? `id="n-${p.liveId}"` : ''}>${p.verdict}</span>
+      </div>
+      <div class="verdict-sub" ${p.liveId ? `id="s-${p.liveId}"` : ''}>${p.verdictSub || '&nbsp;'}</div>
+    </div>`;
+}
+
+const MARKS = { running: '\u00b7\u00b7', done: 'ok', failed: '!!' };
+
+// The curtain lifts on a signal, never on a timer: the server reports each
+// workflow run and then polls AWS until the lab agrees it is back. Until all
+// of that is true, `reset.active` stays set and this stays up.
+function curtain(r) {
+  const el = document.getElementById('curtain');
+  if (!r || (!r.active && !r.error)) { el.hidden = true; return; }
+  el.hidden = false;
+
+  document.getElementById('curtain-steps').innerHTML = (r.steps || []).map((s) =>
+    `<li class="${s.state}"><span class="mark">${MARKS[s.state] || '\u00b7\u00b7'}</span>
+       <span>${s.label}${s.note ? `<span class="note">${s.note}</span>` : ''}</span></li>`
+  ).join('');
+
+  const err = document.getElementById('curtain-err');
+  err.hidden = !r.error;
+  if (r.error) {
+    err.innerHTML = `<b>The reset did not finish.</b>${r.error}
+      <div class="dismiss">The lab is in whatever state it reached. Press R to try
+      again, or Esc to put the board back and look for yourself.</div>`;
+  }
+  document.getElementById('curtain-sub').textContent = r.active
+    ? 'Running the same workflows the runbook documents.'
+    : 'Stopped.';
+}
+
+function draw(d) {
+  last = d;
+  curtain(d.reset);
+  const cfg = SCENES[scene];
+  document.getElementById('mech').innerHTML = cfg.mech;
+
+  const deployed = scene === 'a' ? d.a?.deployed : d.b?.deployed;
+  const [left, right] = cfg.render(d);
+  const L = document.getElementById('twin-left');
+  const R = document.getElementById('twin-right');
+
+  if (!deployed) {
+    const msg = `<div class="waiting">Scenario ${scene.toUpperCase()} is not deployed yet.<br>
+      <span style="font-size:.8em">Run the deploy workflow, then this fills in by itself.</span></div>`;
+    L.innerHTML = msg; R.innerHTML = '';
+    L.className = 'twin'; R.className = 'twin';
+  } else {
+    L.innerHTML = panel(left);  L.className = 'twin ' + (left.tone ? 'is-' + left.tone : '');
+    R.innerHTML = panel(right); R.className = 'twin ' + (right.tone ? 'is-' + right.tone : '');
+  }
+
+  window.__operator = d.operator;
+  drawApprovals(d.approvals || []);
+  drawFeed(
+    (d.events || []).filter((e) => !e.scene || e.scene === 'both' || e.scene === scene),
+    (d.approvals || []).filter((x) => (x.agent_id || '').startsWith(
+      scene === 'a' ? 'warden' : 'custodian')).length,
+  );
+
+  lastPollEpoch = d.at_epoch || null;
+}
+
+// Only new lines are inserted. Rewriting the list every tick restarted each
+// item's entrance animation, which made the whole strip blink twice a second
+// -- fine on a laptop, unwatchable on a projector.
+const shown = new Set();
+
+function drawFeed(events, waiting) {
+  const ul = document.getElementById('feed');
+  if (!events.length) {
+    if (!ul.children.length) {
+      // The strip narrates CHANGES, and a request raised before the board
+      // started is not a change -- so it said "Waiting for something to
+      // happen" with two unanswered requests on screen directly above it.
+      // An empty strip means nothing has happened since the board started,
+      // which is not the same as nothing waiting.
+      const msg = waiting
+        ? `${waiting} request${waiting > 1 ? 's are' : ' is'} waiting for an answer, `
+          + 'raised before this board started. Nothing else has happened since.'
+        : 'Waiting for something to happen…';
+      ul.innerHTML = `<li><span class="${waiting ? 'bad' : 'info'}">${msg}</span></li>`;
+    }
+    return;
+  }
+  if (shown.size === 0) ul.innerHTML = '';
+
+  // Oldest first, so each prepend lands in the right order.
+  for (const e of [...events].reverse()) {
+    const key = e.at + '|' + e.text;
+    if (shown.has(key)) continue;
+    shown.add(key);
+    const li = document.createElement('li');
+    li.innerHTML = `<time>${e.at}</time><span class="${e.tone}"></span>`;
+    li.querySelector('span').textContent = e.text;
+    ul.prepend(li);
+  }
+  while (ul.children.length > 4) ul.lastElementChild.remove();
+}
+
+// ---- approvals -----------------------------------------------------------
+// Rendered incrementally, like the feed, so the ageing timer can tick without
+// the card being rebuilt underneath the operator's cursor mid-click.
+const askEls = new Map();
+let answered = new Set();
+
+function askKey(a) { return a.agent_id + '|' + a.decision_id; }
+
+function ago(iso) {
+  const secs = Math.max(0, (Date.now() - Date.parse(iso)) / 1000);
+  const m = Math.floor(secs / 60), s = Math.floor(secs % 60);
+  return m + 'm ' + String(s).padStart(2, '0') + 's';
+}
+
+function buildAsk(a) {
+  const el = document.createElement('div');
+  el.className = 'ask';
+  el.dataset.since = a.requested_at;
+  const covers = a.blast_radius > 1
+    ? `<b>${Number(a.blast_radius).toLocaleString()}</b> addresses` : '';
+  el.innerHTML = `
+    <div class="ask-body">
+      <div class="ask-head">
+        <span class="ask-who">${a.agent_id}</span>
+        <span class="ask-what">is asking permission</span>
+      </div>
+      <div class="ask-detail">
+        ${a.action || 'Action'} &middot; <b>${a.target || ''}</b>
+        ${covers ? '&middot; covers ' + covers : ''}<br>${a.reason || ''}
+      </div>
+    </div>
+    <div class="ask-age">
+      <div class="ask-age-value" data-age>--</div>
+      <div class="ask-age-label">unanswered</div>
+    </div>
+    <div class="ask-actions">
+      <button class="btn-approve">Approve</button>
+      <button class="btn-deny">Deny</button>
+    </div>`;
+
+  const send = async (verdict) => {
+    el.querySelectorAll('button').forEach((b) => (b.disabled = true));
+    try {
+      await fetch('/api/decide', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ agent_id: a.agent_id, decision_id: a.decision_id, verdict }),
+      });
+      answered.add(askKey(a));
+      markAnswered(el, verdict);
+    } catch {
+      el.querySelectorAll('button').forEach((b) => (b.disabled = false));
+    }
+  };
+  el.querySelector('.btn-approve').onclick = () => send('approved');
+  el.querySelector('.btn-deny').onclick = () => send('denied');
+  return el;
+}
+
+function markAnswered(el, verdict) {
+  el.classList.add('is-answered');
+  el.querySelector('.ask-age').remove();
+  el.querySelector('.ask-actions').outerHTML =
+    `<div class="ask-done">${verdict === 'approved' ? 'Approved' : 'Denied'}</div>`;
+  setTimeout(() => el.remove(), 8000);
+}
+
+// Which column an agent's requests belong in. The suffix of the agent id is
+// the twin key: warden-b and custodian-b are the flawed ones.
+function columnFor(agentId) {
+  const key = (agentId || '').split('-').pop();
+  return COLUMNS.indexOf(key) === 0
+    ? document.getElementById('ask-left')
+    : document.getElementById('ask-right');
+}
+
+function drawApprovals(list) {
+  const live = new Set();
+
+  // Only requests belonging to the scenario on screen. warden-* is Scenario A,
+  // custodian-* is Scenario B.
+  const all = list.filter((a) =>
+    (a.agent_id || '').startsWith(scene === 'a' ? 'warden' : 'custodian'));
+
+  // ONE card at a time, the oldest, and nothing else.
+  //
+  // A busy agent can escalate a dozen entries at once -- observed live, where
+  // fourteen buried the board. Showing two still split the operator's
+  // attention at the exact moment the talk is about a human being the
+  // bottleneck: two cards read as a queue to clear, one reads as a decision
+  // to make. Answer it and the next appears in its place.
+  //
+  // The rest are not hidden; the count below says how many are waiting, which
+  // is the number that matters.
+  const mine = all.slice(0, 1);
+  const overflow = all.length - mine.length;
+
+  for (const a of mine) {
+    const key = askKey(a);
+    if (answered.has(key)) continue;
+    live.add(key);
+    let el = askEls.get(key);
+    if (!el) { el = buildAsk(a); askEls.set(key, el); columnFor(a.agent_id).appendChild(el); }
+    el.dataset.since = a.requested_at;
+  }
+
+  // Anything the backend no longer reports has been resolved elsewhere.
+  for (const [key, el] of askEls) {
+    if (!live.has(key) && !answered.has(key)) { el.remove(); askEls.delete(key); }
+  }
+
+  document.querySelectorAll('.ask-more').forEach((e) => e.remove());
+  if (overflow > 0) {
+    const host = columnFor((mine[0] || all[all.length - 1]).agent_id);
+    const el = document.createElement('div');
+    el.className = 'ask-more';
+    el.textContent = moreText(overflow);
+    host.appendChild(el);
+  }
+  tickAges();
+}
+
+function moreText(n) {
+  return `and ${n} more request${n === 1 ? '' : 's'} waiting`;
+}
+
+async function tick() {
+  try {
+    const d = await (await fetch('/api/state', { cache: 'no-store' })).json();
+    if (d.ready) draw(d);
+  } catch { /* a scoreboard must never be the thing that fails */ }
+}
+// The header clock is a WALL CLOCK and ticks on its own. It used to show the
+// timestamp of the last completed poll, which only advanced when a poll
+// finished -- and a poll took 28 seconds against an interval of 5, so it sat
+// still and then jumped. That reads as broken rather than as slow.
+//
+// How fresh the data is belongs next to it, said plainly, rather than being
+// smuggled into a clock that looks like the time.
+let lastPollEpoch = null;
+
+setInterval(() => {
+  const now = new Date();
+  document.getElementById('clock').textContent = now.toTimeString().slice(0, 8);
+
+  // Freshness is carried by the dot alone: amber once the data is older than
+  // half a minute. Spelling out "9s ago" beside a ticking clock put two
+  // numbers next to each other that meant different things, and the eye read
+  // the wrong one.
+  if (!lastPollEpoch) return;
+  const secs = Math.max(0, Math.round(Date.now() / 1000 - lastPollEpoch));
+  document.getElementById('pulse').classList.toggle('stale', secs > 30);
+}, 1000);
+
+tick();
+setInterval(tick, 2000);
+
+// The ageing timer is the whole point of the band, so it counts in real time
+// rather than jumping two seconds at a time with the poll.
+setInterval(tickAges, 1000);
+
+function tickAges() {
+  for (const el of askEls.values()) {
+    const age = el.querySelector('[data-age]');
+    if (age && el.dataset.since) age.textContent = ago(el.dataset.since);
+  }
+}
+</script>
+</body>
+</html>

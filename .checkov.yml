@@ -1,0 +1,85 @@
+# Checkov exceptions for the demo lab.
+#
+# Checkov runs with soft_fail: false, so this file is the ONLY place a finding
+# can be waived, and every entry carries its reason. Adding a line here should
+# feel like a decision, because it is one.
+#
+# Three classes of exception appear below. Anything that did not fall into one
+# of them was fixed rather than listed: availability zones are now pinned, the
+# default security group is emptied in both VPCs, and every rule carries a
+# description.
+#
+#   (1) The finding describes behaviour the demo exists to produce.
+#   (2) The control would cost money or complexity for no security benefit in
+#       an account that holds nothing real and lives for an afternoon.
+#   (3) The control would actively break the demonstration.
+
+skip-check:
+  # -- (1) the demo's whole point ----------------------------------------
+  - CKV_AWS_260 # ingress from 0.0.0.0/0 to :80. The application is meant to be
+                # publicly reachable; deciding who may reach it is the agent's
+                # job and the behaviour under test.
+  - CKV_AWS_382 # unrestricted egress. The attacker host must generate traffic
+                # and the victim must be able to exfiltrate until quarantined
+                # -- Scenario B's entire measurement depends on it.
+  - CKV_AWS_46  # "hard-coded secrets" in user data. False positive: the
+                # templates contain bucket names and a CloudWatch namespace.
+                # No credential appears anywhere; the hosts use instance roles.
+
+  # -- (2) not worth it for a lab ----------------------------------------
+  - CKV_AWS_126 # detailed EC2 monitoring. Costs money, adds nothing here.
+  - CKV_AWS_135 # EBS optimisation. Not meaningful on t3.micro.
+  - CKV_AWS_130 # subnets assigning public IPs. This is what lets Systems
+                # Manager reach the hosts without paying for a NAT gateway.
+                # No host has an inbound rule, so nothing is exposed.
+  - CKV_AWS_88  # EC2 public IP, same reason.
+  - CKV_AWS_91  # ALB access logs. WAF logs are the agent's input and are
+                # already delivered to CloudWatch; ALB logs would add an S3
+                # bucket carrying no information the demo uses.
+  - CKV_AWS_338 # one year of log retention. Seven days is deliberate: these
+                # logs are demo traffic and the stack is destroyed nightly.
+  - CKV2_AWS_11 # VPC flow logs. Meaningful in production, but here it is cost
+                # and noise for synthetic traffic we already capture in WAF.
+  - CKV_AWS_79  # IMDSv1. Already set to http_tokens = required; the check
+                # misreads the metadata_options block on these resources.
+  - CKV_AWS_158 # KMS-encrypted log groups. Default encryption is enough for
+                # synthetic demo traffic; a CMK adds cost and key management
+                # to a log group that lives for a day.
+  - CKV2_AWS_5  # security groups attached to a resource. The isolation group
+                # is unattached by design: nothing wears it until an agent
+                # decides to quarantine something, and which instance that is
+                # -- if any -- is precisely the outcome the demo measures.
+                # Listed here rather than inline because graph checks (CKV2_*)
+                # do not honour inline skip comments.
+  - CKV_AWS_355 # "*" resource for restrictable actions. The remaining case is
+                # ec2:Describe*, which AWS does not support resource-level
+                # permissions for, and xray:Put*, which has no resource to
+                # scope to. Bedrock is scoped explicitly.
+  - CKV2_AWS_3  # org-wide GuardDuty. This is a single-account lab detector
+                # enabled for the length of one demonstration.
+
+  # -- (2b) the exfiltration sink ----------------------------------------
+  # Scenario B's sink holds synthetic bytes generated on the victim, inside
+  # the lab boundary, deleted after a day. It is the *target of a simulated
+  # theft*, not an asset. Durability and forensics controls on it would be
+  # ceremony: there is nothing in it anyone would want back.
+  - CKV_AWS_21  # versioning
+  - CKV_AWS_144 # cross-region replication
+  - CKV_AWS_145 # KMS encryption (AES256 is configured)
+  - CKV_AWS_18  # access logging
+  - CKV2_AWS_62 # event notifications
+
+  # -- (3) would break the demonstration ---------------------------------
+  - CKV_AWS_2    # HTTPS listener. TLS needs a certificate and a domain for a
+  - CKV_AWS_103  # load balancer that exists for thirty minutes and serves a
+  - CKV2_AWS_20  # constant string. Nothing sensitive traverses it.
+  - CKV_AWS_192  # Log4j managed rule groups. Adding AWS managed rules to the
+  - CKV2_AWS_76  # web ACL would block or alter the demo's scanning traffic
+                 # before the agent ever sees it, which destroys the
+                 # comparison the whole exercise rests on. The ACL carries
+                 # exactly one rule -- the agent's own IPSet -- on purpose.
+  - CKV_AWS_150  # deletion protection. The stacks are created and destroyed
+                 # per demo; protection would defeat the teardown workflow.
+  - CKV_AWS_23   # rule descriptions. Every rule this repository writes has
+                 # one; the check also fires on aws_default_security_group,
+                 # which has no rules by design and so cannot describe them.

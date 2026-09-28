@@ -1,0 +1,286 @@
+# Step 5: activate Scenario B in front of an audience.
+#
+# Starts a genuine compromise on two identical t3.micro instances: a DNS
+# beacon to AWS's documented GuardDuty test domain, which produces a real
+# Backdoor:EC2/C&CActivity.B!DNS finding from the real detector, and a steady
+# exfiltration of a synthetic canary dataset.
+#
+# Nothing here is simulated and nothing is hardcoded. The scoreboard is
+#
+#     bytes_exfiltrated = egress_rate * time_to_containment
+#
+# integrated over real elapsed seconds.
+
+name: agent custodian
+
+on:
+  workflow_dispatch:
+    inputs:
+      phase:
+        description: >-
+          compromise starts the beacon and exfiltration. scoreboard reads the
+          result. reset undoes the run, exactly as `R` on the board does.
+          contain-now is break glass: quarantine both victims immediately.
+        required: true
+        default: compromise
+        type: choice
+        options: [compromise, scoreboard, reset, contain-now]
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+
+jobs:
+  demo:
+    name: ${{ inputs.phase }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEMO_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: locate the victims
+        id: victims
+        run: |
+          set -euo pipefail
+          for twin in custodian-a custodian-b; do
+            id=$(aws ec2 describe-instances \
+              --filters "Name=tag:Project,Values=cosac" \
+                        "Name=tag:Twin,Values=$twin" \
+                        "Name=instance-state-name,Values=running" \
+              --query 'Reservations[0].Instances[0].InstanceId' --output text)
+            if [ "$id" = "None" ]; then
+              echo "::error::Scenario B is not deployed. Run the deploy workflow first."
+              exit 1
+            fi
+            echo "${twin##*-}=$id" >> "$GITHUB_OUTPUT"
+          done
+
+      # -- compromise ------------------------------------------------------
+      # Both victims, simultaneously, with identical commands. Any divergence
+      # from here on is the agents' doing.
+      - name: start the compromise
+        if: inputs.phase == 'compromise'
+        run: |
+          set -euo pipefail
+          cmd=$(aws ssm send-command \
+            --instance-ids "${{ steps.victims.outputs.a }}" "${{ steps.victims.outputs.b }}" \
+            --document-name AWS-RunShellScript \
+            --parameters "commands=['nohup /opt/compromise.sh > /var/log/cosac-compromise.log 2>&1 &']" \
+            --query 'Command.CommandId' --output text)
+
+          {
+            echo "## Compromise started"
+            echo
+            echo "- command: \`$cmd\`"
+            echo "- victims: \`${{ steps.victims.outputs.a }}\` (custodian-a), \`${{ steps.victims.outputs.b }}\` (custodian-b)"
+            echo
+            echo "GuardDuty typically raises the finding within a few minutes."
+            echo "Exfiltration is already running; the counters start now."
+            echo
+            echo "Watch \`BytesExfiltrated\` in the CloudWatch dashboard."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # -- scoreboard ------------------------------------------------------
+      - name: scoreboard
+        if: inputs.phase == 'scoreboard'
+        run: |
+          set -euo pipefail
+          sg_of() {
+            aws ec2 describe-instances --instance-ids "$1" \
+              --query 'Reservations[0].Instances[0].SecurityGroups[0].GroupName' --output text
+          }
+          bytes_of() {
+            aws cloudwatch get-metric-statistics \
+              --namespace COSAC/ScenarioB --metric-name BytesExfiltrated \
+              --dimensions Name=Twin,Value="$1" \
+              --start-time "$(date -u -d '1 hour ago' +%Y-%m-%dT%H:%M:%SZ)" \
+              --end-time "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+              --period 60 --statistics Maximum \
+              --query 'max(Datapoints[].Maximum) || `0`' --output text
+          }
+
+          a_sg=$(sg_of "${{ steps.victims.outputs.a }}")
+          b_sg=$(sg_of "${{ steps.victims.outputs.b }}")
+          a_bytes=$(bytes_of custodian-a)
+          b_bytes=$(bytes_of custodian-b)
+
+          {
+            echo "## Scenario B"
+            echo
+            echo "| | Custodian-A | Custodian-B |"
+            echo "|---|---|---|"
+            echo "| Security group | \`$a_sg\` | \`$b_sg\` |"
+            echo "| Contained | $([ "$a_sg" = "cosac-b-isolation" ] && echo yes || echo **no**) | $([ "$b_sg" = "cosac-b-isolation" ] && echo yes || echo **no**) |"
+            echo "| Bytes exfiltrated | $a_bytes | $b_bytes |"
+            echo
+            echo "Findings received:"
+            echo '```'
+            aws logs tail /cosac/scenario-b/findings --since 1h --format short 2>/dev/null | tail -5 || echo "(none yet)"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # -- contain-now ------------------------------------------------------
+      # Break glass, and nothing else. Quarantines both victims regardless of
+      # profile, which stops the exfiltration immediately and leaves them
+      # isolated for inspection. This is NOT a reset: the machines stay
+      # unusable, the counters keep their last value and the findings stay
+      # open. Run `reset` afterwards to put the lab back.
+      - name: contain now
+        if: inputs.phase == 'contain-now'
+        run: |
+          set -euo pipefail
+          iso=$(aws ec2 describe-security-groups             --filters "Name=group-name,Values=cosac-b-isolation"             --query 'SecurityGroups[0].GroupId' --output text)
+
+          for id in "${{ steps.victims.outputs.a }}" "${{ steps.victims.outputs.b }}"; do
+            aws ec2 modify-instance-attribute --instance-id "$id" --groups "$iso"
+            echo "quarantined $id"
+          done
+
+      # -- reset -------------------------------------------------------------
+      # Four live failures taught this order. In sequence:
+      #
+      #  - the kill was fire-and-forget, so the payload wrote straight over
+      #    the zeroed counter
+      #  - releasing a victim let its agent re-quarantine it mid-reset
+      #  - an SSM agent stopped answering while the box sat at 20% CPU
+      #  - a rebooted victim replayed a queued command and re-infected itself
+      #
+      # And then the one that closes the loop: a QUARANTINED victim cannot be
+      # reached to stop its own beacon. The beacon keeps querying the C2
+      # domain, GuardDuty UPDATES the existing finding rather than raising a
+      # new one, an updated finding is un-archived, the agent quarantines
+      # again -- and round it goes. The byte counter reads zero throughout,
+      # because isolation stops egress, so a reset that reboots only when the
+      # counter moves never fires.
+      #
+      # So the guest is not asked, consulted or trusted. It is rebooted.
+      - name: reset
+        if: inputs.phase == 'reset'
+        run: |
+          set -euo pipefail
+          a="${{ steps.victims.outputs.a }}"
+          b="${{ steps.victims.outputs.b }}"
+          det=$(aws guardduty list-detectors --query 'DetectorIds[0]' --output text)
+
+          open_findings() {
+            if [ "$det" = "None" ]; then return 0; fi
+            aws guardduty list-findings --detector-id "$det" \
+              --finding-criteria '{"Criterion":{"type":{"Eq":["Backdoor:EC2/C&CActivity.B!DNS"]},"service.archived":{"Eq":["false"]}}}' \
+              --query 'FindingIds' --output text
+          }
+
+          archive_findings() {
+            local ids
+            ids=$(open_findings)
+            if [ -n "$ids" ]; then
+              # shellcheck disable=SC2086
+              aws guardduty archive-findings --detector-id "$det" --finding-ids $ids
+              echo "archived $(echo "$ids" | wc -w) finding(s)"
+            fi
+          }
+
+          release() {
+            aws ec2 modify-instance-attribute --instance-id "$1" --groups "$NORMAL"
+          }
+
+          isolated() {  # 0 if the instance is NOT in the normal group
+            local groups
+            groups=$(aws ec2 describe-instances --instance-ids "$1" \
+              --query 'Reservations[0].Instances[0].SecurityGroups[].GroupName' \
+              --output text 2>/dev/null || echo unknown)
+            # "unknown" means the describe call failed. A failed read is
+            # not evidence of anything, so do not act on it.
+            case "$groups" in
+              *cosac-b-normal*|unknown) return 1 ;;
+              *) return 0 ;;
+            esac
+          }
+
+          drain_queue() {  # cancel everything still queued for a victim
+            local id="$1" c
+            for c in $(aws ssm list-commands --instance-id "$id" \
+                --query 'Commands[?Status==`Pending`||Status==`InProgress`].CommandId' \
+                --output text 2>/dev/null); do
+              aws ssm cancel-command --command-id "$c" --instance-ids "$id" >/dev/null 2>&1 || true
+              echo "cancelled queued command $c for $id"
+            done
+          }
+
+          NORMAL=$(aws ec2 describe-security-groups \
+            --filters "Name=group-name,Values=cosac-b-normal" \
+            --query 'SecurityGroups[0].GroupId' --output text)
+
+          # 1. empty the command queue first. An SSM agent that has been
+          #    offline replays it on reconnect, oldest first -- including the
+          #    command that started the compromise.
+          for id in "$a" "$b"; do drain_queue "$id"; done
+
+          # 2. reboot both victims, unconditionally. This is the only step
+          #    that reliably ends the beacon, and it needs no agent inside the
+          #    guest: the payload is started by command rather than user-data,
+          #    so it does not come back. Asking nicely first bought nothing
+          #    except a longer reset and a way to fail.
+          aws ec2 reboot-instances --instance-ids "$a" "$b"
+          echo "rebooted both victims"
+
+          # 3. release them while they boot
+          for id in "$a" "$b"; do release "$id"; echo "released $id"; done
+
+          # 4. settle. GuardDuty's pipeline lags by minutes, so for a while
+          #    after a run an archived finding comes back -- and an agent
+          #    acting on it quarantines the machine again. Keep archiving and
+          #    keep releasing until the lab holds still twice in a row.
+          clean=0
+          for attempt in $(seq 1 20); do
+            archive_findings
+            for id in "$a" "$b"; do
+              if isolated "$id"; then
+                echo "$id was quarantined again; releasing"
+                release "$id"
+                clean=0
+              fi
+            done
+
+            if [ -z "$(open_findings)" ]; then
+              clean=$((clean + 1))
+            else
+              clean=0
+            fi
+
+            if [ "$clean" -ge 2 ]; then
+              echo "lab settled after ${attempt} check(s)"
+              break
+            fi
+            if [ "$attempt" = "20" ]; then
+              echo "::error::the lab would not settle: findings keep reappearing"
+              exit 1
+            fi
+            sleep 15
+          done
+
+          # 5. zero the counters. Only now: nothing is left to write over it.
+          for twin in custodian-a custodian-b; do
+            aws cloudwatch put-metric-data \
+              --namespace COSAC/ScenarioB --metric-name BytesExfiltrated \
+              --dimensions Twin="$twin" --storage-resolution 1 --value 0
+          done
+          echo "counters zeroed"
+
+          # 6. withdraw approvals nobody answered, including any the agents
+          #    raised while the lab was settling.
+          aws dynamodb scan --table-name cosac-decision-ledger \
+            --filter-expression '#s = :p' \
+            --expression-attribute-names '{"#s":"status"}' \
+            --expression-attribute-values '{":p":{"S":"pending"}}' \
+            --query 'Items[].[agent_id.S,decision_id.S]' --output text \
+          | while read -r agent decision; do
+              if [ -z "${agent:-}" ]; then continue; fi
+              aws dynamodb delete-item --table-name cosac-decision-ledger \
+                --key "{\"agent_id\":{\"S\":\"$agent\"},\"decision_id\":{\"S\":\"$decision\"}}"
+              echo "withdrew $decision"
+            done
